@@ -21,7 +21,7 @@ from nuscenes.utils.data_classes import Box
 from nuscenes.utils.geometry_utils import view_points, transform_matrix
 from pyquaternion import Quaternion
 
-from dataset.data_util import img_loader, mask_loader_scene, align_dataset, stack_sample
+from dataset.data_util import img_loader, mask_loader_scene, align_dataset, stack_sample, build_lidar_range_image, LIDAR_NUM_RINGS, LIDAR_AZIMUTH_RESOLUTION
 
 
 
@@ -942,11 +942,56 @@ class NuScenesdataset4D(Dataset):
                 all_dict['vehicle_annotations'] = cur_sample['vehicle_annotations']
                 all_context_dict['vehicle_annotations'] = cur_sample['vehicle_annotations']
 
+        lidar_data = {}
+        if hasattr(self, 'dataset') and self.dataset is not None:
+            try:
+                source_sample_data = self.dataset.get('sample', frame_idx)
+                if 'LIDAR_TOP' in source_sample_data.get('data', {}):
+                    lidar_sample = self.dataset.get('sample_data', source_sample_data['data']['LIDAR_TOP'])
+                    lidar_file = os.path.join(self.path, lidar_sample['filename'])
+                    lidar_points = np.fromfile(lidar_file, dtype=np.float32).reshape(-1, 5)
+
+                    lidar_pose = self.dataset.get('ego_pose', lidar_sample['ego_pose_token'])
+                    calib = self.dataset.get('calibrated_sensor', lidar_sample['calibrated_sensor_token'])
+
+                    lidar_rotation = Quaternion(lidar_pose['rotation']).rotation_matrix
+                    lidar_translation = np.array(lidar_pose['translation'])[:, None]
+                    ego_to_world = np.vstack([
+                        np.hstack((lidar_rotation, lidar_translation)),
+                        np.array([0, 0, 0, 1])
+                    ])
+
+                    calib_rot = Quaternion(calib['rotation']).rotation_matrix
+                    calib_trans = np.array(calib['translation']).reshape(1, 3)
+                    lidar_to_ego = np.eye(4)
+                    lidar_to_ego[:3, :3] = calib_rot
+                    lidar_to_ego[:3, 3] = calib_trans
+
+                    raster_pts, gt_depth, gt_intensity, gt_ray_drop, el_boundaries = build_lidar_range_image(
+                        lidar_points, lidar_to_ego, ego_to_world, lidar_sample['timestamp']
+                    )
+
+                    world_to_lidar = np.linalg.inv(ego_to_world @ lidar_to_ego)
+
+                    lidar_data = {
+                        'raster_pts': torch.from_numpy(raster_pts).float(),
+                        'viewmat': torch.from_numpy(world_to_lidar).float()[None],
+                        'tile_elevation_boundaries': torch.from_numpy(el_boundaries).float(),
+                        'n_elevation_channels': LIDAR_NUM_RINGS,
+                        'azimuth_resolution': LIDAR_AZIMUTH_RESOLUTION,
+                        'gt_depth': torch.from_numpy(gt_depth).float(),
+                        'gt_intensity': torch.from_numpy(gt_intensity).float(),
+                        'gt_ray_drop': torch.from_numpy(gt_ray_drop).float(),
+                    }
+            except Exception as e:
+                print(f"Warning: Could not load lidar data: {e}")
+
         ret_sample = {
             'cur_sample': cur_sample,
             'context_frames': all_context_dict,
             'target_frames': target_dict,
-            'all_dict': all_dict
+            'all_dict': all_dict,
+            'lidar': lidar_data,
         }
         return ret_sample
 
@@ -973,6 +1018,14 @@ def custom_collate_fn(batch):
             result[key] = values
         elif key in ['all_dict', 'context_frames']:
             result[key] = custom_collate_fn(values)
+        elif isinstance(key, str) and key == 'lidar':
+            lidar_keys = values[0].keys()
+            result[key] = {}
+            for lk in lidar_keys:
+                try:
+                    result[key][lk] = torch.stack([v[lk] for v in values], dim=0)
+                except:
+                    result[key][lk] = [v[lk] for v in values]
         else:
             try:
                 result[key] = default_collate(values)

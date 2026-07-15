@@ -26,7 +26,7 @@ from skimage.metrics import structural_similarity
 from kornia.losses import SSIMLoss
 from math import log2, log
 import sys
-from gsplat.rendering import rasterization
+from gsplat.rendering import rasterization, lidar_rasterization
 import cv2
 from sam2.build_sam import build_sam2
 from sam2.sam2_image_predictor import SAM2ImagePredictor
@@ -37,14 +37,15 @@ from torch.utils.checkpoint import checkpoint
 from models.vggt.models.vggt import VGGT
 from models.vggt.heads.dpt_head import DPTHead
 from models.vggt.heads.gs_dpt_head import VGGT_DPT_GS_Head
+from models.lidar_decoder import LidarDecoder
 from models.gaussian_util import render, focal2fov, getProjectionMatrix, depth2pc, pc2depth, rotate_sh, quat_multiply
-from models.loss_util import compute_photometric_loss, compute_masked_loss, compute_edg_smooth_loss
+from models.loss_util import compute_photometric_loss, compute_masked_loss, compute_edg_smooth_loss, compute_lidar_loss
 from utils.visual_util import predictions_to_glb
 from models.geometry_util import Projection
 
 from models.gaussian_util import render, focal2fov, getProjectionMatrix,  depth2pc, pc2depth, rotate_sh, quat_multiply
 
-from models.loss_util import compute_photometric_loss, compute_masked_loss, compute_edg_smooth_loss
+from models.loss_util import compute_photometric_loss, compute_masked_loss, compute_edg_smooth_loss, compute_lidar_loss
 from utils.visual_util import predictions_to_glb
 from models.geometry_util import Projection
 
@@ -139,7 +140,7 @@ def load_lora_state_dict(model, state_dict):
 
 
 class ReconDriveModel(torch.nn.Module):
-    def __init__(self, sh_degree, min_depth, max_depth, vggt_checkpoint="./checkpoints/vggt.pt"):
+    def __init__(self, sh_degree, min_depth, max_depth, vggt_checkpoint="./checkpoints/vggt.pt", lidar_feat_dim=16):
         super(ReconDriveModel, self).__init__()
         self.img_size = 518
         self.patch_size = 14
@@ -147,6 +148,7 @@ class ReconDriveModel(torch.nn.Module):
         self.sh_degree = sh_degree
         self.min_depth = min_depth
         self.max_depth = max_depth
+        self.lidar_feat_dim = lidar_feat_dim
 
         vggt_model = VGGT()
         # VGGT_URL = "https://huggingface.co/facebook/VGGT-1B/resolve/main/model.pt"
@@ -175,7 +177,7 @@ class ReconDriveModel(torch.nn.Module):
         for degree in range(1, self.sh_degree + 1):
             self.sh_mask[degree**2 : (degree + 1) ** 2] = 0.1 * 0.25**degree
 
-        self.raw_gs_dim =  1 + 3 + 4 + 3*self.d_sh # opacity + scale + rot + d_sh
+        self.raw_gs_dim =  1 + 3 + 4 + 3*self.d_sh + self.lidar_feat_dim # opacity + scale + rot + sh + lidar_feat
 
         self.gs_head = VGGT_DPT_GS_Head(
             dim_in=2 * self.embed_dim,
@@ -295,7 +297,8 @@ class ReconDriveModel(torch.nn.Module):
                 patch_start_idx=patch_start_idx,
             )  # batch_size, view_num,  H , W, D
 
-            rot_maps, scale_maps, opacity_maps, sh_maps = raw_gaussian.split((4, 3, 1, 3 * self.d_sh), dim=-1)
+            rot_maps, scale_maps, opacity_maps, sh_maps, lidar_feat_maps = raw_gaussian.split(
+                (4, 3, 1, 3 * self.d_sh, self.lidar_feat_dim), dim=-1)
             
             rot_maps = rot_maps / (rot_maps.norm(dim=-1, keepdim=True) + 1e-8)
             scale_maps = nn.functional.softplus(scale_maps,beta=1) * 0.01
@@ -315,7 +318,7 @@ class ReconDriveModel(torch.nn.Module):
                 # Create zero flow tensor with the same shape
                 b, v, h, w, _ = depth_maps.shape
                 forward_flow = torch.zeros(b, v, h, w, 3, dtype=depth_maps.dtype, device=depth_maps.device)
-        return depth_maps, rot_maps, scale_maps, opacity_maps, sh_maps, forward_flow
+        return depth_maps, rot_maps, scale_maps, opacity_maps, sh_maps, forward_flow, lidar_feat_maps
     
     def forward_renderer(self, gs_params, data_dict, render_motion_seg=True, radius_clip=0.0):
         b, t, v, h, w, _ = gs_params["means"].shape
@@ -580,7 +583,9 @@ class ReconDrive_LITModelModule(pl.LightningModule):
 
         self.save_dir = save_dir
         vggt_checkpoint = getattr(self, 'vggt_checkpoint', './checkpoints/vggt.pt')
-        self.model = ReconDriveModel(sh_degree=self.sh_degree,min_depth=self.min_depth, max_depth=self.max_depth, vggt_checkpoint=vggt_checkpoint) 
+        lidar_feat_dim = getattr(self, 'lidar_feat_dim', 16)
+        self.model = ReconDriveModel(sh_degree=self.sh_degree, min_depth=self.min_depth, max_depth=self.max_depth, vggt_checkpoint=vggt_checkpoint, lidar_feat_dim=lidar_feat_dim) 
+        self.lidar_decoder = LidarDecoder(feature_dim=self.model.lidar_feat_dim)
         self.lpips = LPIPS(net="vgg")
         self.ssim_fn = SSIMLoss(window_size=11,reduction='none')
         self.l1_fn = torch.nn.L1Loss(reduction='none')
@@ -805,6 +810,64 @@ class ReconDrive_LITModelModule(pl.LightningModule):
         self.context_span = 6
          
 
+    def render_lidar(self, recontrast_data, batch_input):
+        lidar_data = batch_input.get('lidar')
+        if not lidar_data or 'raster_pts' not in lidar_data or lidar_data['raster_pts'].numel() == 0:
+            return None
+
+        B = recontrast_data['xyz'].shape[0]
+        depth_list, intensity_list, raydrop_list = [], [], []
+
+        for bid in range(B):
+            rp = lidar_data['raster_pts'][bid]
+            vm = lidar_data['viewmat'][bid]
+            el_boundaries = lidar_data['tile_elevation_boundaries']
+            if el_boundaries.dim() > 1:
+                el_boundaries = el_boundaries[bid]
+            n_el = lidar_data['n_elevation_channels'][bid].item() if hasattr(lidar_data['n_elevation_channels'], '__getitem__') else lidar_data['n_elevation_channels']
+            az_res = lidar_data['azimuth_resolution']
+            if hasattr(az_res, '__getitem__'):
+                az_res = az_res[bid].item()
+
+            render, alpha, _, _ = lidar_rasterization(
+                means=recontrast_data['xyz'][bid],
+                quats=recontrast_data['rot_maps'][bid],
+                scales=recontrast_data['scale_maps'][bid],
+                opacities=recontrast_data['opacity_maps'][bid].squeeze(-1),
+                lidar_features=recontrast_data['lidar_feat_maps'][bid],
+                velocities=None,
+                viewmats=vm,
+                raster_pts=rp,
+                tile_elevation_boundaries=el_boundaries,
+                n_elevation_channels=int(n_el),
+                azimuth_resolution=float(az_res),
+                near_plane=0.2,
+                far_plane=300,
+                compute_alpha_sum_until_points=False,
+            )
+
+            depth = render[..., -1:]
+            features = render[..., :-1]
+
+            rp_deg = torch.deg2rad(rp[..., :2])
+            ray_dir = torch.cat([
+                torch.cos(rp_deg[..., 0:1]) * torch.cos(rp_deg[..., 1:2]),
+                torch.sin(rp_deg[..., 0:1]) * torch.cos(rp_deg[..., 1:2]),
+                torch.sin(rp_deg[..., 1:2]),
+            ], dim=-1)
+
+            intensity, ray_drop_logits = self.lidar_decoder(features, ray_dir)
+
+            depth_list.append(depth)
+            intensity_list.append(intensity)
+            raydrop_list.append(ray_drop_logits)
+
+        return {
+            "depth": torch.stack(depth_list),
+            "intensity": torch.stack(intensity_list).sigmoid(),
+            "ray_drop_logits": torch.stack(raydrop_list),
+        }
+
     def training_step(self, batch_input, batch_idx):
         self.stage = stage = 'train'
 
@@ -824,13 +887,29 @@ class ReconDrive_LITModelModule(pl.LightningModule):
         batch_render_project_data = self.render_project_imgs(batch_input, batch_recontrast_data)
         loss_project = self.compute_project_loss(batch_render_project_data)
 
+        loss_lidar = torch.tensor(0.0, device=self.device)
+        lidar_out = self.render_lidar(batch_recontrast_data, batch_input)
+        if lidar_out is not None and 'lidar' in batch_input:
+            gt = batch_input['lidar']
+            loss_lidar = compute_lidar_loss(
+                pred_depth=lidar_out['depth'],
+                gt_depth=gt['gt_depth'],
+                pred_intensity=lidar_out['intensity'],
+                gt_intensity=gt['gt_intensity'],
+                pred_ray_drop_logits=lidar_out['ray_drop_logits'],
+                gt_ray_drop=gt['gt_ray_drop'],
+                lambda_depth=getattr(self, 'lambda_lidar_depth', 1.0),
+                lambda_intensity=getattr(self, 'lambda_lidar_intensity', 0.1),
+                lambda_raydrop=getattr(self, 'lambda_lidar_raydrop', 0.01),
+            )
 
         self.log(f'{stage}/gs', loss_gaussian.item(), on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
         self.log(f'{stage}/proj', loss_project.item(), on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
         self.log(f'{stage}/norm', loss_norm.item(), on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
+        if loss_lidar.item() > 0:
+            self.log(f'{stage}/lidar', loss_lidar.item(), on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
 
-        # Exclude projection loss from total loss
-        loss_all = loss_gaussian + loss_depth + loss_project + loss_norm
+        loss_all = loss_gaussian + loss_depth + loss_project + loss_norm + loss_lidar
         psnr, ssim, lpips = self.compute_reconstruction_metrics(batch_splating_data,stage)
 
         del batch_input, batch_recontrast_data, batch_render_data, batch_render_project_data, batch_splating_data, psnr, ssim, lpips
@@ -899,13 +978,25 @@ class ReconDrive_LITModelModule(pl.LightningModule):
         loss_depth = self.compute_depth_loss(batch_splating_data)
         loss_gaussian = self.compute_gaussian_loss(batch_splating_data)
 
+        loss_lidar = torch.tensor(0.0, device=self.device)
+        lidar_out = self.render_lidar(batch_recontrast_data, batch_input)
+        if lidar_out is not None and 'lidar' in batch_input:
+            gt = batch_input['lidar']
+            loss_lidar = compute_lidar_loss(
+                pred_depth=lidar_out['depth'], gt_depth=gt['gt_depth'],
+                pred_intensity=lidar_out['intensity'], gt_intensity=gt['gt_intensity'],
+                pred_ray_drop_logits=lidar_out['ray_drop_logits'], gt_ray_drop=gt['gt_ray_drop'],
+            )
+
         self.log(f'{stage}/gs', loss_gaussian.item(), on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
         self.log(f'{stage}/proj', loss_project.item(), on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
         self.log(f'{stage}/depth', loss_depth.item(), on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
         self.log(f'{stage}/norm', loss_norm.item(), on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
+        if loss_lidar.item() > 0:
+            self.log(f'{stage}/lidar', loss_lidar.item(), on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
 
         # Exclude projection loss from total loss
-        loss_all = loss_gaussian + loss_depth + loss_norm + loss_project
+        loss_all = loss_gaussian + loss_depth + loss_norm + loss_project + loss_lidar
         psnr, ssim, lpips = self.compute_reconstruction_metrics(batch_splating_data,stage)
 
         del batch_input,batch_recontrast_data, batch_render_data, batch_render_project_data, batch_splating_data, psnr, ssim, lpips
@@ -935,12 +1026,24 @@ class ReconDrive_LITModelModule(pl.LightningModule):
         loss_depth = self.compute_depth_loss(batch_recontrast_data)
         loss_gaussian = self.compute_gaussian_loss(batch_splating_data)
 
+        loss_lidar = torch.tensor(0.0, device=self.device)
+        lidar_out = self.render_lidar(batch_recontrast_data, batch_input)
+        if lidar_out is not None and 'lidar' in batch_input:
+            gt = batch_input['lidar']
+            loss_lidar = compute_lidar_loss(
+                pred_depth=lidar_out['depth'], gt_depth=gt['gt_depth'],
+                pred_intensity=lidar_out['intensity'], gt_intensity=gt['gt_intensity'],
+                pred_ray_drop_logits=lidar_out['ray_drop_logits'], gt_ray_drop=gt['gt_ray_drop'],
+            )
+
         self.log(f'{stage}/gs', loss_gaussian.item(), on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
         self.log(f'{stage}/proj', loss_project.item(), on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
         self.log(f'{stage}/depth', loss_depth.item(), on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
         self.log(f'{stage}/norm', loss_norm.item(), on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
+        if loss_lidar.item() > 0:
+            self.log(f'{stage}/lidar', loss_lidar.item(), on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
 
-        loss_all = loss_gaussian + loss_depth + loss_norm + loss_project
+        loss_all = loss_gaussian + loss_depth + loss_norm + loss_project + loss_lidar
         psnr, ssim, lpips = self.compute_reconstruction_metrics(batch_splating_data,stage)
 
         del batch_input,batch_recontrast_data, batch_render_data, batch_render_project_data, batch_splating_data, psnr, ssim, lpips
@@ -1339,7 +1442,7 @@ class ReconDrive_LITModelModule(pl.LightningModule):
 
         # 6 -> 18
         # [4, 6, 280, 518, 1], [4, 6, 280, 518, 4], [4, 6, 280, 518, 3], [4, 6, 280, 518, 1], [4, 6, 280, 518, 3, 25], [4, 6, 280, 518, 3]
-        depth_maps, rot_maps, scale_maps, opacity_maps, sh_maps, forward_flow = self.model(image_list)
+        depth_maps, rot_maps, scale_maps, opacity_maps, sh_maps, forward_flow, lidar_feat_maps = self.model(image_list)
         del image_list
         batch_size = depth_maps.shape[0]
         frame_camrea = depth_maps.shape[1]
@@ -1372,6 +1475,7 @@ class ReconDrive_LITModelModule(pl.LightningModule):
         outputs['scale_maps'] = rearrange(scale_maps, 'b c h w d -> b (c h w) d', d=3)#.contiguous()
         outputs['opacity_maps'] = rearrange(opacity_maps, 'b c h w d -> b (c h w) d')#.contiguous()
         outputs['sh_maps'] = rearrange(bfc_sh, '(b c) h w p d -> b (c h w) d p', b=batch_size, c=frame_camrea)#.contiguous()
+        outputs['lidar_feat_maps'] = rearrange(lidar_feat_maps, 'b c h w d -> b (c h w) d')
 
         # Generate vehicle-based 3D velocity flow
         if self.use_vehicle_flow:

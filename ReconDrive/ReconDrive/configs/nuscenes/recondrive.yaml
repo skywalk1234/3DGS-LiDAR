@@ -42,6 +42,12 @@ model_cfg:
   lambda_scale: 0.01
   lambda_opacity: 0.01
 
+  # LiDAR loss weights
+  lambda_lidar_depth: 1.0
+  lambda_lidar_intensity: 0.1
+  lambda_lidar_raydrop: 0.01
+  lidar_feat_dim: 16
+
   # Model checkpoint paths
   vggt_checkpoint: 'checkpoints/vggt.pt'
   sam2_checkpoint: 'checkpoints/sam2.1_hiera_small.pt'  # Relative to SAM2 installation directory

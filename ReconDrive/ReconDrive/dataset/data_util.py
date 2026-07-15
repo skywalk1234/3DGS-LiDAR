@@ -212,6 +212,69 @@ def to_tensor(x: Union[np.ndarray, List, Tuple]) -> torch.Tensor:
     return x
 
 
+LIDAR_NUM_RINGS = 32
+LIDAR_AZIMUTH_BINS = 3600
+LIDAR_ELEVATIONS = np.linspace(-30, 10, LIDAR_NUM_RINGS)
+LIDAR_AZIMUTH_RESOLUTION = 360.0 / LIDAR_AZIMUTH_BINS
+
+
+def build_lidar_range_image(lidar_points, lidar_to_ego, ego_to_world, lidar_timestamp):
+    xyz = lidar_points[:, :3]
+    intensity = lidar_points[:, 3] / 255.0
+    ring = lidar_points[:, 4].astype(int)
+
+    ones = np.ones((xyz.shape[0], 1))
+    xyz_homo = np.concatenate([xyz, ones], axis=1)
+    xyz_ego = (lidar_to_ego @ xyz_homo.T).T
+
+    depth = np.linalg.norm(xyz, axis=1)
+    azimuth = np.degrees(np.arctan2(xyz[:, 1], xyz[:, 0]))
+    elevation = np.degrees(np.arcsin(xyz[:, 2] / (depth + 1e-8)))
+
+    H, W = LIDAR_NUM_RINGS, LIDAR_AZIMUTH_BINS
+
+    gt_depth = np.zeros((H, W), dtype=np.float32)
+    gt_intensity = np.zeros((H, W), dtype=np.float32)
+    gt_ray_drop = np.zeros((H, W), dtype=np.float32)
+
+    for r in range(LIDAR_NUM_RINGS):
+        mask = ring == r
+        if not mask.any():
+            continue
+        pts_az = azimuth[mask] % 360
+        pts_d = depth[mask]
+        pts_int = intensity[mask]
+        col = (pts_az / LIDAR_AZIMUTH_RESOLUTION).astype(int) % W
+        for ci in range(W):
+            bin_mask = col == ci
+            if bin_mask.any():
+                nearest = np.argmin(pts_d[bin_mask])
+                gt_depth[r, ci] = pts_d[bin_mask][nearest]
+                gt_intensity[r, ci] = pts_int[bin_mask][nearest]
+                gt_ray_drop[r, ci] = 1.0
+
+    az_grid, el_grid = np.meshgrid(
+        np.linspace(0, 360, W, endpoint=False),
+        LIDAR_ELEVATIONS,
+    )
+    depth_init = gt_depth.copy()
+    depth_init[depth_init == 0] = 50.0
+    raster_pts = np.stack([
+        az_grid, el_grid, depth_init, np.zeros_like(az_grid)
+    ], axis=-1)
+
+    tile_height = 8
+    el_boundaries = np.linspace(-30, 10, LIDAR_NUM_RINGS // tile_height + 1)
+
+    return (
+        raster_pts[None],
+        gt_depth[None, ..., None],
+        gt_intensity[None, ..., None],
+        gt_ray_drop[None, ..., None],
+        el_boundaries,
+    )
+
+
 def to_float_tensor(d):
     if isinstance(d, dict):
         return {k: to_float_tensor(v) for k, v in d.items()}
