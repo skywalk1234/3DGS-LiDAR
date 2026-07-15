@@ -385,6 +385,7 @@ class ReconDriveModel(torch.nn.Module):
                             scales=scales_batched[bid],
                             opacities=opacities_batched[bid],
                             colors=colors_batched[bid],
+                            velocities=None,
                             viewmats=viewmats_batched[bid],
                             Ks=Ks_batched[bid],
                             width=data_dict["width"],
@@ -422,6 +423,7 @@ class ReconDriveModel(torch.nn.Module):
                             scales=scales_batched[bid],
                             opacities=opacities_batched[bid],
                             colors=colors_batched[bid],
+                            velocities=None,
                             viewmats=viewmats_batched[bid],
                             Ks=Ks_batched[bid],
                             width=data_dict["width"],
@@ -455,6 +457,7 @@ class ReconDriveModel(torch.nn.Module):
                             if self.num_motion_tokens > 0 and render_motion_seg
                             else colors_batched.float()
                         ),
+                        velocities=None,
                         viewmats=viewmats_batched,
                         Ks=Ks_batched,
                         width=tgt_w,
@@ -477,6 +480,7 @@ class ReconDriveModel(torch.nn.Module):
                                 scales=scales_batched.float(),
                                 opacities=opacities_batched.float(),
                                 colors=rendered_colors[..., i : i + chunksize],
+                                velocities=None,
                                 viewmats=viewmats_batched,
                                 Ks=Ks_batched,
                                 width=tgt_w,
@@ -501,6 +505,7 @@ class ReconDriveModel(torch.nn.Module):
                         scales=scales_batched.float(),
                         opacities=opacities_batched.float(),
                         colors=colors_batched.float(),
+                        velocities=None,
                         viewmats=viewmats_batched,
                         Ks=Ks_batched,
                         width=tgt_w,
@@ -1942,10 +1947,11 @@ class ReconDrive_LITModelModule(pl.LightningModule):
                             scale_cam,  # [2*points_per_cam, 3]
                             opacity_cam.squeeze(-1),  # [2*points_per_cam]
                             sh_cam,  # [2*points_per_cam, K, 3]
-                            e2c_extr_cam,  # [1, 4, 4]
-                            K_cam,  # [1, 3, 3]
-                            self.render_width,
-                            self.render_height,
+                            velocities=None,
+                            viewmats=e2c_extr_cam,  # [1, 4, 4]
+                            Ks=K_cam,  # [1, 3, 3]
+                            width=self.render_width,
+                            height=self.render_height,
                             sh_degree=self.sh_degree,
                             render_mode="RGB",
                         )
@@ -1990,10 +1996,11 @@ class ReconDrive_LITModelModule(pl.LightningModule):
                         scale_i,  # [N, 3]
                         opacity_i.squeeze(-1),  # [N]
                         sh_i,  # [N, K, 3]
-                        e2c_extr_i,  # [6, 4, 4]
-                        K_i,  # [6, 3, 3]
-                        self.render_width,
-                        self.render_height,
+                        velocities=None,
+                        viewmats=e2c_extr_i,  # [6, 4, 4]
+                        Ks=K_i,  # [6, 3, 3]
+                        width=self.render_width,
+                        height=self.render_height,
                         sh_degree=self.sh_degree,
                         render_mode="RGB",
                         # sparse_grad=True,

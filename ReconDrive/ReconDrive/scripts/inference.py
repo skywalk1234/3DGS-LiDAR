@@ -198,10 +198,11 @@ def render_novel_views(model, recontrast_data, render_data, device, scene_name, 
                     scale_i.squeeze(0),    # [N, 3]
                     opacity_i.squeeze(0).squeeze(-1),  # [N]
                     sh_i.squeeze(0),       # [N, K, 3]
-                    novel_e2c_extr,        # [1, 4, 4]
-                    K_i,                   # [1, 3, 3]
-                    model_width,
-                    model_height,
+                    velocities=None,
+                    viewmats=novel_e2c_extr,  # [1, 4, 4]
+                    Ks=K_i,                   # [1, 3, 3]
+                    width=model_width,
+                    height=model_height,
                     sh_degree=getattr(model, 'sh_degree', 3),
                     render_mode="RGB",
                 )

@@ -2218,10 +2218,11 @@ class ReconDrive_LITModelModule(pl.LightningModule):
                     scale_i,  # [N, 3]
                     opacity_i.squeeze(-1),  # [N]
                     sh_i,  # [N, K, 3]
-                    e2c_extr_i,  # [1, 4, 4]
-                    K_i,  # [1, 3, 3]
-                    self.render_width,
-                    self.render_height,
+                    velocities=None,
+                    viewmats=e2c_extr_i,  # [1, 4, 4]
+                    Ks=K_i,  # [1, 3, 3]
+                    width=self.render_width,
+                    height=self.render_height,
                     sh_degree=self.sh_degree,
                     render_mode="RGB",
                     # sparse_grad=True,
@@ -3107,10 +3108,11 @@ if __name__=='__main__':
                 scales,  # [N, 3]
                 opacities.squeeze(1),  # [N]
                 sh_maps,  # [N, K, 3]
-                e2c_extr[None],  # [1, 4, 4]
-                K[None,:3,:3],  # [1, 3, 3]
-                width,
-                height,
+                velocities=None,
+                viewmats=e2c_extr[None],  # [1, 4, 4]
+                Ks=K[None,:3,:3],  # [1, 3, 3]
+                width=width,
+                height=height,
                 sh_degree=sh_degree,
                 render_mode="RGB",
                 # this is to speedup large-scale rendering by skipping far-away Gaussians.
