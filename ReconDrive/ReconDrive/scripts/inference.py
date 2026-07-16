@@ -340,6 +340,15 @@ def _process_scene_batch(model, scene_batch, device, gpu_id=0, save_renders=True
         model_width = getattr(model, 'width', 518)
         model_height = getattr(model, 'height', 280)
 
+        # --- LiDAR Rendering ---
+        lidar_out = None
+        lidar_gt = None
+        if isinstance(output, tuple):
+            batch_recontrast_data = output[0]
+            lidar_out = model.render_lidar(batch_recontrast_data, batch_data)
+            if lidar_out is not None:
+                lidar_gt = batch_data.get('lidar', None)
+        # -----------------------
 
         if isinstance(output, tuple):
             batch_recontrast_data, batch_render_data, batch_splating_data = output
@@ -489,6 +498,58 @@ def _process_scene_batch(model, scene_batch, device, gpu_id=0, save_renders=True
                     device, scene_name, 0, output_dir, actual_sample_idx, novel_distances, eval_resolution, novel_render_frames
                 )
                 print(f"GPU {gpu_id}: Saved novel views for sample {actual_sample_idx}: {len(novel_view_paths)} images")
+
+            # --- Save LiDAR results ---
+            if lidar_out is not None and output_dir:
+                global_sample_idx = actual_sample_idx
+                lidar_dir = os.path.join(output_dir, scene_name, f'sample_{global_sample_idx:04d}', 'lidar')
+                os.makedirs(lidar_dir, exist_ok=True)
+
+                def _save_lidar_map(arr, path):
+                    """Squeeze to 2D and save as PNG"""
+                    arr_2d = np.ascontiguousarray(arr.squeeze())
+                    if arr_2d.ndim == 1:
+                        arr_2d = arr_2d.reshape(1, -1)
+                    Image.fromarray(arr_2d).save(path)
+
+                # Predicted depth [B, H, W, 1]
+                pred_depth = lidar_out['depth'][0]  # [H, W, 1]
+                pred_depth_np = pred_depth.detach().cpu().numpy()
+                depth_mm = np.clip(pred_depth_np * 1000, 0, 65535).astype(np.uint16)
+                _save_lidar_map(depth_mm, os.path.join(lidar_dir, 'pred_depth.png'))
+
+                # Predicted intensity [B, H, W, 1]
+                pred_intensity = lidar_out['intensity'][0]  # [H, W, 1]
+                pred_intensity_np = (pred_intensity.detach().cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
+                _save_lidar_map(pred_intensity_np, os.path.join(lidar_dir, 'pred_intensity.png'))
+
+                # Predicted ray_drop probability [B, H, W, 1]
+                pred_ray_drop = lidar_out['ray_drop_logits'][0].sigmoid()  # [H, W, 1]
+                pred_ray_drop_np = (pred_ray_drop.detach().cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
+                _save_lidar_map(pred_ray_drop_np, os.path.join(lidar_dir, 'pred_ray_drop.png'))
+
+                # Ground truth (if available)
+                if lidar_gt is not None:
+                    gt_depth = lidar_gt['gt_depth'][0]
+                    gt_depth_np = gt_depth.detach().cpu().numpy()
+                    gt_depth_mm = np.clip(gt_depth_np * 1000, 0, 65535).astype(np.uint16)
+                    _save_lidar_map(gt_depth_mm, os.path.join(lidar_dir, 'gt_depth.png'))
+
+                    gt_intensity = lidar_gt['gt_intensity'][0]
+                    gt_intensity_np = (gt_intensity.detach().cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
+                    _save_lidar_map(gt_intensity_np, os.path.join(lidar_dir, 'gt_intensity.png'))
+
+                    gt_ray_drop = lidar_gt['gt_ray_drop'][0]
+                    gt_ray_drop_np = (gt_ray_drop.detach().cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
+                    _save_lidar_map(gt_ray_drop_np, os.path.join(lidar_dir, 'gt_ray_drop.png'))
+
+                    # Compute LiDAR metrics
+                    valid = gt_depth > 0
+                    depth_mae = (pred_depth[valid] - gt_depth[valid]).abs().mean().item() if valid.any() else 0.0
+                    intensity_mae = (pred_intensity[valid] - gt_intensity[valid]).abs().mean().item() if valid.any() else 0.0
+                    ray_drop_acc = ((pred_ray_drop > 0.5) == (gt_ray_drop > 0.5)).float().mean().item()
+                    print(f"GPU {gpu_id}: LiDAR metrics - DepthMAE: {depth_mae:.4f}, IntMAE: {intensity_mae:.4f}, RayDropAcc: {ray_drop_acc:.4f}")
+            # -------------------------
 
             # Aggregate scene-level metrics (keep modes separate)
             scene_psnr_list.extend(recon_psnr + novel_psnr)

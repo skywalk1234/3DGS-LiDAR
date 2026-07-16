@@ -824,17 +824,19 @@ class ReconDrive_LITModelModule(pl.LightningModule):
             el_boundaries = lidar_data['tile_elevation_boundaries']
             if el_boundaries.dim() > 1:
                 el_boundaries = el_boundaries[bid]
-            n_el = lidar_data['n_elevation_channels'][bid].item() if hasattr(lidar_data['n_elevation_channels'], '__getitem__') else lidar_data['n_elevation_channels']
+            n_el_val = lidar_data['n_elevation_channels'][bid] if hasattr(lidar_data['n_elevation_channels'], '__getitem__') else lidar_data['n_elevation_channels']
+            n_el = n_el_val.item() if hasattr(n_el_val, 'item') else int(n_el_val)
             az_res = lidar_data['azimuth_resolution']
             if hasattr(az_res, '__getitem__'):
-                az_res = az_res[bid].item()
+                az_res_val = az_res[bid]
+                az_res = az_res_val.item() if hasattr(az_res_val, 'item') else float(az_res_val)
 
             render, alpha, _, _ = lidar_rasterization(
                 means=recontrast_data['xyz'][bid],
                 quats=recontrast_data['rot_maps'][bid],
                 scales=recontrast_data['scale_maps'][bid],
                 opacities=recontrast_data['opacity_maps'][bid].squeeze(-1),
-                lidar_features=recontrast_data['lidar_feat_maps'][bid],
+                lidar_features=recontrast_data['lidar_feat_maps'][bid].unsqueeze(0),  # [1, N, D]
                 velocities=None,
                 viewmats=vm,
                 raster_pts=rp,
