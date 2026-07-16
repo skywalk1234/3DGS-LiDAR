@@ -951,7 +951,7 @@ class NuScenesdataset4D(Dataset):
                     'raster_pts': torch.from_numpy(raster_pts).float(),
                     'viewmat': torch.from_numpy(world_to_lidar).float()[None],
                     'tile_elevation_boundaries': torch.from_numpy(el_boundaries).float(),
-                    'n_elevation_channels': n_elevation_channels,
+                    'n_elevation_channels': LIDAR_NUM_RINGS,
                     'azimuth_resolution': LIDAR_AZIMUTH_RESOLUTION,
                     'gt_depth': torch.from_numpy(gt_depth).float(),
                     'gt_intensity': torch.from_numpy(gt_intensity).float(),
