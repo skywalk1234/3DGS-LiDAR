@@ -1022,7 +1022,7 @@ class ReconDrive_LITModelModule(pl.LightningModule):
 
         batch_splating_data  = self.render_splating_imgs(batch_recontrast_data,batch_render_data)
 
-        loss_depth = self.compute_depth_loss(batch_recontrast_data)
+        loss_depth = self.compute_depth_loss(batch_splating_data)
         loss_gaussian = self.compute_gaussian_loss(batch_splating_data)
 
         loss_lidar = torch.tensor(0.0, device=self.device)
