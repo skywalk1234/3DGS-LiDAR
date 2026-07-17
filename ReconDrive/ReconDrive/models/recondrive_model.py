@@ -1766,27 +1766,58 @@ class ReconDrive_LITModelModule(pl.LightningModule):
                 outputs['input_all'][key] = ego_T_ego
 
         # Compute missing ego transformations using camera transformation chain
-        # Use all_dict which contains ego poses for all 7 frames (0-6)
-        # Compute or load ego_T_ego transformations
-        # Training path: use precomputed values from dataloader (computed in __getitem__)
-        # Inference path: compute here (get_scene_sample doesn't precompute)
-        for frame_id in range(1, self.context_span + 1):
+        # Search order: input_all → all_dict → context_frames → target_frames → compute from ego_pose
+        # Determine max available frame from all_dict data
+        total_views = inputs[('color_aug', 0)].shape[1] if ('color_aug', 0) in inputs else 0
+        max_data_frame = (total_views // self.num_cams) - 1 if total_views > 0 else 0
+        max_frame = min(self.context_span, max_data_frame)
+        for frame_id in range(1, max_frame + 1):
             key = ('ego_T_ego', 0, frame_id)
             if key in outputs['input_all']:
                 continue
 
-            # Get precomputed ego_T_ego from dataloader (computed in __getitem__)
-            if key in data_dict['all_dict']:
-                # Dataset returns torch tensor [1, 4, 4] or [1, num_cameras, 4, 4]
+            ego_T_ego = None
+
+            # 1. Check data_dict['all_dict'] (precomputed by dataset)
+            if ego_T_ego is None and key in data_dict.get('all_dict', {}):
                 ego_T_ego = data_dict['all_dict'][key]
-                # Extract camera 0's ego_T_ego if multi-camera format
-                if ego_T_ego.dim() == 4:
-                    ego_T_ego = ego_T_ego[:, 0]  # [batch_size, 4, 4]
-                ego_T_ego = ego_T_ego.to(inputs['c2e_extr'].device)
-                outputs['input_all'][key] = ego_T_ego
-            else:
-                raise KeyError(f"ego_T_ego key {key} not found in data_dict['all_dict']. "
-                             f"This should be precomputed in the dataset.")
+
+            # 2. Check data_dict['context_frames']
+            if ego_T_ego is None:
+                ctx = data_dict.get('context_frames', {})
+                if isinstance(ctx, dict) and key in ctx:
+                    ego_T_ego = ctx[key]
+
+            # 3. Check data_dict['target_frames']
+            if ego_T_ego is None:
+                tgt = data_dict.get('target_frames', {})
+                if isinstance(tgt, dict) and key in tgt:
+                    ego_T_ego = tgt[key]
+
+            # 4. Compute from ego_pose on the fly
+            if ego_T_ego is None:
+                try:
+                    all_dict = data_dict['all_dict']
+                    # all_dict['ego_pose'] shape: [batch_size, total_frames*num_cams, 4, 4]
+                    # indexed like color_aug: idx = frame_id * num_cams + cam_id
+                    idx_0 = 0 * self.num_cams + 0            # frame 0, camera 0
+                    idx_N = frame_id * self.num_cams + 0      # frame N, camera 0
+                    ego_pose_0 = all_dict['ego_pose'][:, idx_0]   # [B, 4, 4]
+                    ego_pose_N = all_dict['ego_pose'][:, idx_N]   # [B, 4, 4]
+                    c2e_extr = inputs['c2e_extr'][:, 0]            # [B, 4, 4]
+                    e2c_extr = torch.linalg.inv(c2e_extr)          # [B, 4, 4]
+                    ego_T_ego = c2e_extr @ torch.linalg.inv(ego_pose_0) @ ego_pose_N @ e2c_extr
+                    ego_T_ego[:, 3, :] = torch.tensor([0, 0, 0, 1], device=ego_T_ego.device)
+                except Exception as e:
+                    raise KeyError(f"Cannot find or compute ego_T_ego for {key}. "
+                                   f"Checked all_dict/context_frames/target_frames and "
+                                   f"on-the-fly compute failed: {e}")
+
+            # Extract camera 0's ego_T_ego if multi-camera format
+            if ego_T_ego.dim() == 4 and ego_T_ego.shape[1] == self.num_cams:
+                ego_T_ego = ego_T_ego[:, 0]
+            ego_T_ego = ego_T_ego.to(inputs['c2e_extr'].device)
+            outputs['input_all'][key] = ego_T_ego
 
         for frame_id in self.all_render_frame_ids:
             for cam_id in range(self.num_cams):
