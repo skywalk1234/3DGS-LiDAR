@@ -759,55 +759,46 @@ class ReconDrive_LITModelModule(pl.LightningModule):
         
         outputs = {}
 
-    # TODO: Hardcode setting here
     def prob_sample_rendered_ids(self):
-        prob_all_render_frame_ids = [0.7, 0.3, 0.2, 0.1, 0.1, 0.05, 0]
+        num_frames = self.context_span + 1
+        prob_all_render_frame_ids = [0.7] + [0.3] * (num_frames - 2) + [0.2, 0.0] if num_frames >= 2 else [1.0]
+        prob_all_render_frame_ids = prob_all_render_frame_ids[:num_frames] if num_frames <= 7 else prob_all_render_frame_ids + [0.0] * (num_frames - 7)
+        prob_all_render_frame_ids = prob_all_render_frame_ids[:num_frames]
+        if len(prob_all_render_frame_ids) < num_frames:
+            prob_all_render_frame_ids += [0.0] * (num_frames - len(prob_all_render_frame_ids))
 
-        # For multi-GPU training: use different random values for each GPU
-        # Get the global rank to ensure different GPUs get different samples
         if hasattr(self, 'global_rank') and self.global_rank is not None:
-            # Create a temporary random state based on global_rank and current step
-            # This ensures different GPUs get different samples while maintaining reproducibility
             rng = np.random.RandomState()
-            # Use a combination of training step (or epoch) and rank for seed
-            # This way each GPU gets different samples, but same GPU gets same sequence
             current_step = self.global_step if hasattr(self, 'global_step') else 0
             temp_seed = hash((current_step, self.global_rank)) % (2**32)
             rng.seed(temp_seed)
-            render_prob = rng.rand(7)
+            render_prob = rng.rand(num_frames)
         else:
-            # Single GPU or inference mode - use global random state
-            render_prob = np.random.rand(7)
+            render_prob = np.random.rand(num_frames)
 
         all_render_frame_ids_mask = render_prob < prob_all_render_frame_ids
-
         selected_ids = np.nonzero(all_render_frame_ids_mask)[0].tolist()
-        # Ensure at least one sample ID is selected
-        if len(selected_ids) == 0:
-            # If no IDs were selected, select based on weighted probabilities
-            valid_probs = prob_all_render_frame_ids[:6]  # Exclude last one with 0 probability
-            probabilities = np.array(valid_probs)
-            probabilities = probabilities / probabilities.sum()  # Normalize to sum to 1
-            if hasattr(self, 'global_rank') and self.global_rank is not None:
-                selected_ids = [rng.choice(6, p=probabilities)]
-            else:
-                selected_ids = [np.random.choice(6, p=probabilities)]
 
-        # Limit maximum number of selected frames to 4 to avoid CUDA OOM
+        if len(selected_ids) == 0:
+            valid_probs = np.array(prob_all_render_frame_ids[:-1] if num_frames > 1 else prob_all_render_frame_ids)
+            valid_probs = valid_probs / (valid_probs.sum() + 1e-8)
+            if hasattr(self, 'global_rank') and self.global_rank is not None:
+                selected_ids = [rng.choice(len(valid_probs), p=valid_probs)]
+            else:
+                selected_ids = [np.random.choice(len(valid_probs), p=valid_probs)]
+
         if len(selected_ids) > 4:
             if hasattr(self, 'global_rank') and self.global_rank is not None:
                 selected_ids = sorted(rng.choice(selected_ids, size=4, replace=False).tolist())
             else:
                 selected_ids = sorted(np.random.choice(selected_ids, size=4, replace=False).tolist())
 
-        # Add rank info to debug message for multi-GPU
         if hasattr(self, 'global_rank') and self.global_rank is not None:
             print(f"[GPU {self.global_rank}] Sampling rendered ids: {selected_ids}")
         else:
             print(f"Sampling rendered ids: {selected_ids}")
 
         self.all_render_frame_ids = selected_ids
-        self.context_span = 6
          
 
     def render_lidar(self, recontrast_data, batch_input):
