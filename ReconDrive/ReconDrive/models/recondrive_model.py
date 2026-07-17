@@ -896,6 +896,12 @@ class ReconDrive_LITModelModule(pl.LightningModule):
                 lambda_raydrop=getattr(self, 'lambda_lidar_raydrop', 0.01),
             )
 
+        # Clean up lidar memory to avoid OOM accumulation
+        if lidar_out is not None:
+            del lidar_out
+        if 'lidar' in batch_input:
+            del batch_input['lidar']
+
         self.log(f'{stage}/gs', loss_gaussian.item(), on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
         self.log(f'{stage}/proj', loss_project.item(), on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
         self.log(f'{stage}/norm', loss_norm.item(), on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
