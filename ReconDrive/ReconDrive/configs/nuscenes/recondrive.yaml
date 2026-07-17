@@ -71,7 +71,7 @@ data_cfg:
   train_requirements: (gt_pose, gt_ego_pose, gt_depth, mask)
   val_requirements: (gt_pose, gt_ego_pose, gt_depth, mask)
   
-  batch_size: 2
+  batch_size: 1
   data_shuffle: True
   drop_last: False
   num_workers: 4
