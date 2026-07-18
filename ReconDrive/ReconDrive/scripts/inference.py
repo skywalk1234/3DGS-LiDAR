@@ -316,6 +316,9 @@ def _process_scene_batch(model, scene_batch, device, gpu_id=0, save_renders=True
     )
 
     scene_psnr_list, scene_ssim_list, scene_lpips_list = [], [], []
+    lidar_depth_l2_list, lidar_depth_median_l2_list = [], []
+    lidar_intensity_rmse_list, lidar_ray_drop_acc_list = [], []
+    lidar_chamfer_dist_list = []
     batch_count = 0
 
     for batch_data in scene_loader:
@@ -545,10 +548,61 @@ def _process_scene_batch(model, scene_batch, device, gpu_id=0, save_renders=True
 
                     # Compute LiDAR metrics
                     valid = gt_depth > 0
-                    depth_mae = (pred_depth[valid] - gt_depth[valid]).abs().mean().item() if valid.any() else 0.0
-                    intensity_mae = (pred_intensity[valid] - gt_intensity[valid]).abs().mean().item() if valid.any() else 0.0
+                    
+                    # Depth L2 (MSE)
+                    depth_sq = (pred_depth[valid] - gt_depth[valid]) ** 2
+                    depth_l2 = depth_sq.mean().item() if valid.any() else 0.0
+                    
+                    # Median Depth L2
+                    depth_median_l2 = depth_sq.median().item() if valid.any() else 0.0
+
+                    # Intensity RMSE
+                    intensity_sq = ((pred_intensity[valid] - gt_intensity[valid]) ** 2)
+                    intensity_rmse = intensity_sq.mean().sqrt().item() if valid.any() else 0.0
+                    
+                    # Ray Drop Acc
                     ray_drop_acc = ((pred_ray_drop > 0.5) == (gt_ray_drop > 0.5)).float().mean().item()
-                    print(f"GPU {gpu_id}: LiDAR metrics - DepthMAE: {depth_mae:.4f}, IntMAE: {intensity_mae:.4f}, RayDropAcc: {ray_drop_acc:.4f}")
+
+                    # Chamfer Distance (3D point cloud, subsampled for memory)
+                    chamfer_dist = 0.0
+                    if valid.any():
+                        raster_pts = lidar_gt['raster_pts'][0]  # [H, W, 4]
+                        az_rad = torch.deg2rad(raster_pts[..., 0:1])    # [H, W, 1]
+                        el_rad = torch.deg2rad(raster_pts[..., 1:2])    # [H, W, 1]
+                        cos_el = torch.cos(el_rad)
+                        # GT & Pred 3D points
+                        gt_d = gt_depth.expand_as(az_rad)
+                        pred_d = pred_depth.expand_as(az_rad)
+                        x_gt = gt_d * cos_el * torch.cos(az_rad)
+                        y_gt = gt_d * cos_el * torch.sin(az_rad)
+                        z_gt = gt_d * torch.sin(el_rad)
+                        x_pred = pred_d * cos_el * torch.cos(az_rad)
+                        y_pred = pred_d * cos_el * torch.sin(az_rad)
+                        z_pred = pred_d * torch.sin(el_rad)
+                        pts_gt = torch.stack([x_gt, y_gt, z_gt], dim=-1)   # [H, W, 3]
+                        pts_pred = torch.stack([x_pred, y_pred, z_pred], dim=-1)
+                        pts_gt_v = pts_gt[valid.squeeze(-1)]    # [N, 3]
+                        pts_pred_v = pts_pred[valid.squeeze(-1)] # [N, 3]
+                        N = pts_gt_v.shape[0]
+                        # Subsample to at most 2048 points to keep O(N^2) cdist tractable
+                        max_pts = 2048
+                        if N > max_pts:
+                            idx = torch.randperm(N, device=pts_gt_v.device)[:max_pts]
+                            pts_gt_v = pts_gt_v[idx]
+                            pts_pred_v = pts_pred_v[idx]
+                        dist_g2p = torch.cdist(pts_gt_v, pts_pred_v).min(dim=1).values.mean().item()
+                        dist_p2g = torch.cdist(pts_pred_v, pts_gt_v).min(dim=1).values.mean().item()
+                        chamfer_dist = dist_g2p + dist_p2g
+
+                    print(f"GPU {gpu_id}: LiDAR metrics - DepthL2: {depth_l2:.4f}, MedDepthL2: {depth_median_l2:.4f}, "
+                          f"IntRMSE: {intensity_rmse:.4f}, RayDropAcc: {ray_drop_acc:.4f}, ChamferDist: {chamfer_dist:.4f}")
+
+                    # Accumulate
+                    lidar_depth_l2_list.append(depth_l2)
+                    lidar_depth_median_l2_list.append(depth_median_l2)
+                    lidar_intensity_rmse_list.append(intensity_rmse)
+                    lidar_ray_drop_acc_list.append(ray_drop_acc)
+                    lidar_chamfer_dist_list.append(chamfer_dist)
             # -------------------------
 
             # Aggregate scene-level metrics (keep modes separate)
@@ -561,6 +615,20 @@ def _process_scene_batch(model, scene_batch, device, gpu_id=0, save_renders=True
     scene_processing_time = time.time() - scene_start_time
 
     # Return scene results with separate reconstruction and novel view metrics
+    lidar_metrics = {}
+    if lidar_depth_l2_list:
+        lidar_metrics = {
+            'depth_l2': np.mean(lidar_depth_l2_list),
+            'depth_l2_std': np.std(lidar_depth_l2_list),
+            'depth_median_l2': np.mean(lidar_depth_median_l2_list),
+            'depth_median_l2_std': np.std(lidar_depth_median_l2_list),
+            'intensity_rmse': np.mean(lidar_intensity_rmse_list),
+            'intensity_rmse_std': np.std(lidar_intensity_rmse_list),
+            'ray_drop_acc': np.mean(lidar_ray_drop_acc_list),
+            'ray_drop_acc_std': np.std(lidar_ray_drop_acc_list),
+            'chamfer_distance': np.mean(lidar_chamfer_dist_list),
+            'chamfer_distance_std': np.std(lidar_chamfer_dist_list),
+        }
     return {
         'scene_idx': scene_batch.get('scene_idx', 0),
         'scene_name': scene_name,
@@ -575,7 +643,8 @@ def _process_scene_batch(model, scene_batch, device, gpu_id=0, save_renders=True
             'lpips': np.mean(scene_lpips_list) if scene_lpips_list else 0.0,
             'psnr_std': np.std(scene_psnr_list) if scene_psnr_list else 0.0,
             'ssim_std': np.std(scene_ssim_list) if scene_ssim_list else 0.0,
-            'lpips_std': np.std(scene_lpips_list) if scene_lpips_list else 0.0
+            'lpips_std': np.std(scene_lpips_list) if scene_lpips_list else 0.0,
+            **lidar_metrics
         },
         'sample_metrics': {
             'psnr_list': scene_psnr_list,
@@ -628,6 +697,18 @@ def _run_single_gpu_inference(model, scene_dataloader, device, save_results=True
             novel_ssim.extend(result['novel_metrics']['ssim_list'])
             novel_lpips.extend(result['novel_metrics']['lpips_list'])
 
+    # Aggregate LiDAR metrics across scenes
+    lidar_depth_l2_all, lidar_depth_median_l2_all = [], []
+    lidar_intensity_rmse_all, lidar_ray_drop_acc_all, lidar_chamfer_dist_all = [], [], []
+    for r in all_scene_results:
+        m = r.get('metrics', {})
+        if 'depth_l2' in m:
+            lidar_depth_l2_all.append(m['depth_l2'])
+            lidar_depth_median_l2_all.append(m['depth_median_l2'])
+            lidar_intensity_rmse_all.append(m['intensity_rmse'])
+            lidar_ray_drop_acc_all.append(m['ray_drop_acc'])
+            lidar_chamfer_dist_all.append(m['chamfer_distance'])
+
     # Print final results - separate for reconstruction and novel view
     final_psnr = np.mean(overall_psnr) if overall_psnr else 0.0
     final_ssim = np.mean(overall_ssim) if overall_ssim else 0.0
@@ -650,13 +731,37 @@ def _run_single_gpu_inference(model, scene_dataloader, device, save_results=True
     print(f"  PSNR: {final_recon_psnr:.4f}, SSIM: {final_recon_ssim:.4f}, LPIPS: {final_recon_lpips:.4f}")
     print(f"\nNovel View Synthesis (Middle Frames):")
     print(f"  PSNR: {final_novel_psnr:.4f}, SSIM: {final_novel_ssim:.4f}, LPIPS: {final_novel_lpips:.4f}")
+    if lidar_depth_l2_all:
+        print(f"\nLiDAR Metrics (scenes: {len(lidar_depth_l2_all)}):")
+        print(f"  Depth L2: {np.mean(lidar_depth_l2_all):.4f} ± {np.std(lidar_depth_l2_all):.4f}")
+        print(f"  Median Depth L2: {np.mean(lidar_depth_median_l2_all):.4f} ± {np.std(lidar_depth_median_l2_all):.4f}")
+        print(f"  Intensity RMSE: {np.mean(lidar_intensity_rmse_all):.4f} ± {np.std(lidar_intensity_rmse_all):.4f}")
+        print(f"  Ray Drop Acc: {np.mean(lidar_ray_drop_acc_all):.4f} ± {np.std(lidar_ray_drop_acc_all):.4f}")
+        print(f"  Chamfer Distance: {np.mean(lidar_chamfer_dist_all):.4f} ± {np.std(lidar_chamfer_dist_all):.4f}")
     
     # Save results
     # if save_results and output_dir:
     if output_dir:
+        lidar_overall = {}
+        if lidar_depth_l2_all:
+            lidar_overall = {
+                'depth_l2': np.mean(lidar_depth_l2_all),
+                'depth_l2_std': np.std(lidar_depth_l2_all),
+                'depth_median_l2': np.mean(lidar_depth_median_l2_all),
+                'depth_median_l2_std': np.std(lidar_depth_median_l2_all),
+                'intensity_rmse': np.mean(lidar_intensity_rmse_all),
+                'intensity_rmse_std': np.std(lidar_intensity_rmse_all),
+                'ray_drop_acc': np.mean(lidar_ray_drop_acc_all),
+                'ray_drop_acc_std': np.std(lidar_ray_drop_acc_all),
+                'chamfer_distance': np.mean(lidar_chamfer_dist_all),
+                'chamfer_distance_std': np.std(lidar_chamfer_dist_all),
+            }
         final_results = {
-            'overall_metrics': {'psnr': final_psnr, 'ssim': final_ssim, 'lpips': final_lpips,
-                               'psnr_std': np.std(overall_psnr), 'ssim_std': np.std(overall_ssim), 'lpips_std': np.std(overall_lpips)},
+            'overall_metrics': {
+                'psnr': final_psnr, 'ssim': final_ssim, 'lpips': final_lpips,
+                'psnr_std': np.std(overall_psnr), 'ssim_std': np.std(overall_ssim), 'lpips_std': np.std(overall_lpips),
+                **lidar_overall
+            },
             'scene_results': all_scene_results
         }
         save_inference_results(final_results, output_dir)
