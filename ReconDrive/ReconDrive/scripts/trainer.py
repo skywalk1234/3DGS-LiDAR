@@ -13,8 +13,9 @@ import torch
 from pathlib import Path
 from pytorch_lightning.loggers import TensorBoardLogger
 
-# Add models directory to path for vggt imports
+# Add project root and models directory to path
 project_root = Path(__file__).parent.parent
+sys.path.append(str(project_root))
 sys.path.append(str(project_root / "models"))
 
 import pytorch_lightning as pl
@@ -132,12 +133,13 @@ def main():
         gradient_clip_val=1.0,
         callbacks=[checkpoint_callback, periodic_checkpoint_callback, LearningRateMonitor(), export_metric_callback],
         deterministic=True,
-        log_every_n_steps=100,
+        log_every_n_steps=1,
         enable_progress_bar=True,
         enable_model_summary=True,
         strategy='ddp_find_unused_parameters_true',
         profiler="simple",
-        logger=logger
+        logger=logger,
+        overfit_batches=1,
     )
 
     torch.use_deterministic_algorithms(mode=True,warn_only=True)
