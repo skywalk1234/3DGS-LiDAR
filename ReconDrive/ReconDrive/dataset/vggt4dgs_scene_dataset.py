@@ -945,11 +945,13 @@ class NuScenesdataset4D(Dataset):
                     lidar_points, lidar_to_ego, ego_to_world, lidar_sample['timestamp']
                 )
 
-                world_to_lidar = np.linalg.inv(ego_to_world @ lidar_to_ego)
+                # Use ego_to_lidar because Gaussians are in ego frame, not world frame
+                # (depth2pc uses ego_to_camera extrinsic, output is in ego frame)
+                ego_to_lidar = np.linalg.inv(lidar_to_ego)
 
                 lidar_data = {
                     'raster_pts': torch.from_numpy(raster_pts).float(),
-                    'viewmat': torch.from_numpy(world_to_lidar).float()[None],
+                    'viewmat': torch.from_numpy(ego_to_lidar).float()[None],
                     'tile_elevation_boundaries': torch.from_numpy(el_boundaries).float(),
                     'n_elevation_channels': torch.tensor(LIDAR_NUM_RINGS, dtype=torch.long),
                     'azimuth_resolution': torch.tensor(LIDAR_AZIMUTH_RESOLUTION, dtype=torch.float),

@@ -241,10 +241,11 @@ def build_lidar_range_image(lidar_points, lidar_to_ego, ego_to_world, lidar_time
         mask = ring == r
         if not mask.any():
             continue
-        pts_az = azimuth[mask] % 360
+        # azimuth in [-180, 180) from arctan2; bin into [-180, 180) grid
+        pts_az = azimuth[mask]
         pts_d = depth[mask]
         pts_int = intensity[mask]
-        col = (pts_az / LIDAR_AZIMUTH_RESOLUTION).astype(int) % W
+        col = ((pts_az + 180) / LIDAR_AZIMUTH_RESOLUTION).astype(int) % W
         for ci in range(W):
             bin_mask = col == ci
             if bin_mask.any():
@@ -253,8 +254,9 @@ def build_lidar_range_image(lidar_points, lidar_to_ego, ego_to_world, lidar_time
                 gt_intensity[r, ci] = pts_int[bin_mask][nearest]
                 gt_ray_drop[r, ci] = 1.0
 
+    # raster_pts azimuth in [-180, 180) to match CUDA projection's atan2 range
     az_grid, el_grid = np.meshgrid(
-        np.linspace(0, 360, W, endpoint=False),
+        np.linspace(-180, 180, W, endpoint=False),
         LIDAR_ELEVATIONS,
     )
     depth_init = gt_depth.copy()
