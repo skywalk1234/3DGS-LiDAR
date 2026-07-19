@@ -45,6 +45,46 @@ context_span: 1                         context_span: 6
 
 ***
 
+## 三、必传文件清单
+
+⚠️ **注意**：本地 `checkpoints/` 是一个软链接 → `/data/public_data/ReconDrive_checkpoint`。需要在自己服务器上创建同样的软链接或直接替换为实际目录。
+
+如果要用 `best_module-v2.ckpt` 做微调，仍需要把以下模型权重文件一并传过去（模型构造时就需要加载，即使后续会被 checkpoint 覆盖）：
+
+| 文件                                                       | 大小       | 说明                                   |
+| -------------------------------------------------------- | -------- | ------------------------------------ |
+| `checkpoints/vggt.pt`                                    | \~2.5 GB | VGGT backbone 预训练权重（`__init__` 时就加载） |
+| `checkpoints/sam2.1_hiera_small.pt`                      | \~150 MB | SAM2 分割模型权重（训练时懒加载）                  |
+| `work_dirs/recondrive_training/ckpt/best_module-v2.ckpt` | \~4.3 GB | 微调用 checkpoint（可选，不传则从头训）            |
+
+### 收到文件需要做的
+
+```bash
+cd /path/to/ReconDrive
+
+# 方案1（推荐）：创建软链接指向服务器上的权重目录
+ln -s /path/to/colleagues/checkpoint/dir checkpoints
+
+# 方案2：直接创建目录，把收到的权重文件放进去
+mkdir checkpoints
+# 然后把 vggt.pt 和 sam2.1_hiera_small.pt 放进去
+```
+
+如果不挂载软链接或不放这些文件，训练时会直接报错找不到对应权重。
+
+### 下载链接
+
+VGGT 和 SAM2 的预训练权重可以从官方获取：
+
+| 模型 | 下载地址 |
+|------|---------|
+| VGGT | `https://huggingface.co/facebook/VGGT-1B/resolve/main/model.pt`（另存为 `checkpoints/vggt.pt`） |
+| SAM2 | 安装 `pip install sam2` 后，从安装目录中找到 `sam2.1_hiera_small.pt`，或从 GitHub Releases 下载 |
+
+VGGT 下载后改名为 `vggt.pt`，SAM2 改名为 `sam2.1_hiera_small.pt`，放入 `checkpoints/` 目录即可。
+
+***
+
 ## 四、训练命令
 
 ### 从 checkpoint 训练
@@ -116,38 +156,11 @@ python show_lidar/visualize_lidar.py work_dirs/inference_full --batch
 └── v1.0-trainval/
 ```
 
-***
 
-## 六、必传文件清单
-
-⚠️ **注意**：本地 `checkpoints/` 是一个软链接 → `/data/public_data/ReconDrive_checkpoint`。需要在自己服务器上创建同样的软链接或直接替换为实际目录。
-
-如果要用 `best_module-v2.ckpt` 做微调，仍需要把以下模型权重文件一并传过去（模型构造时就需要加载，即使后续会被 checkpoint 覆盖）：
-
-| 文件                                                       | 大小       | 说明                                   |
-| -------------------------------------------------------- | -------- | ------------------------------------ |
-| `checkpoints/vggt.pt`                                    | \~2.5 GB | VGGT backbone 预训练权重（`__init__` 时就加载） |
-| `checkpoints/sam2.1_hiera_small.pt`                      | \~150 MB | SAM2 分割模型权重（训练时懒加载）                  |
-| `work_dirs/recondrive_training/ckpt/best_module-v2.ckpt` | \~4.3 GB | 微调用 checkpoint（可选，不传则从头训）            |
-
-### 收到文件需要做的
-
-```bash
-cd /path/to/ReconDrive
-
-# 方案1（推荐）：创建软链接指向服务器上的权重目录
-ln -s /path/to/colleagues/checkpoint/dir checkpoints
-
-# 方案2：直接创建目录，把收到的权重文件放进去
-mkdir checkpoints
-# 然后把 vggt.pt 和 sam2.1_hiera_small.pt 放进去
-```
-
-如果不挂载软链接或不放这些文件，训练时会直接报错找不到对应权重。
 
 ***
 
-## 七、注意事项
+## 六、注意事项
 
 1. **首次运行会缓存数据**：全量 nuscenes 预处理生成缓存到 `cache_dir`，约 **50-100 GB**，耗时数小时
 2. **训练时间预估**：700 场景 × 10 epoch，8 卡 H100 约 **2-3 天**
