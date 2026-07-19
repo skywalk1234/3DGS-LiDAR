@@ -139,7 +139,6 @@ def main():
         strategy='ddp_find_unused_parameters_true',
         profiler="simple",
         logger=logger,
-        overfit_batches=1,
     )
 
     torch.use_deterministic_algorithms(mode=True,warn_only=True)
