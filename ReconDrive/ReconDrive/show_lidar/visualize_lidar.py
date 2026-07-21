@@ -104,8 +104,8 @@ def visualize_lidar(lidar_dir, output_path=None, dpi=150):
             cmap = 'gray'
         elif kind == 'ray_drop':
             vis = img.astype(np.float32) / 255.0
-            if fname.startswith('gt_'):
-                vis[img == 0] = np.nan  # no return → transparent
+            # ray_drop is binary: 0 = hit (no drop), 255 = drop
+            # Show as-is, no NaN masking
             cmap = 'gray'
         else:
             vis = img
