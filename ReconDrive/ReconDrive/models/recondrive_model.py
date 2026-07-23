@@ -722,8 +722,10 @@ class ReconDrive_LITModelModule(pl.LightningModule):
         for k, v in cfg.items():
             setattr(self, k, v)
 
-        # Calculate time_delta from context_span (assumes 12Hz sampling rate)
-        self.time_delta = getattr(self, 'context_span', 6) / 12.0
+        # Calculate frame step duration from frame_rate (Hz)
+        self.frame_step_s = 1.0 / getattr(self, 'frame_rate', 12)
+        # Total time span from frame 0 to frame context_span
+        self.time_delta = getattr(self, 'context_span', 6) * self.frame_step_s
         # Set default for use_vehicle_flow if not in config
         if not hasattr(self, 'use_vehicle_flow'):
             self.use_vehicle_flow = True
@@ -1980,7 +1982,8 @@ class ReconDrive_LITModelModule(pl.LightningModule):
 
             xyz_t = xyz.clone()
             if self.use_vehicle_flow:
-                context_span_delta = self.context_span / 12.0
+                # Total time span: context_span * frame_step_s
+                context_span_delta = self.context_span * self.frame_step_s
                 delta_t_flow = (frame_id / self.context_span) * context_span_delta
                 xyz_t[:, :mid_point] += flow[:, :mid_point] * delta_t_flow
                 xyz_t[:, mid_point:] -= flow[:, mid_point:] * (context_span_delta - delta_t_flow)

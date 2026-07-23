@@ -25,6 +25,8 @@ model_cfg:
 
   frame_ids: [0, 1]
 
+  frame_rate: 2  # Dataset frame rate (Hz): 2 for mini, 12 for full
+
   use_vehicle_flow: true
 
   depth_conf_thr: 0.99
