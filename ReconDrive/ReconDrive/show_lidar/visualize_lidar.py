@@ -7,7 +7,7 @@ as a side-by-side 2x3 grid with proper color mapping.
 
 Usage:
   # Single lidar folder
-  python show_lidar/visualize_lidar.py work_dirs/.../scene-0061/sample_0000/lidar
+  python show_lidar/visualize_lidar.py /data/mr/project/ReconDrive/ReconDrive/work_dirs/inference_trained_results_v4/scene-0061/sample_0000/lidar
 
   # Multiple folders
   python show_lidar/visualize_lidar.py <folder1> <folder2> ...
@@ -16,7 +16,7 @@ Usage:
   python show_lidar/visualize_lidar.py work_dirs/inference_trained_results_v3 --batch
 
   # Batch with a specific scene filter
-  python show_lidar/visualize_lidar.py work_dirs/inference_trained_results_v3 --batch --scene scene-0061
+  python show_lidar/visualize_lidar.py work_dirs/inference_trained_results_v5 --batch --scene scene-0061
 """
 
 import argparse
@@ -27,8 +27,12 @@ import sys
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+from matplotlib.colors import LinearSegmentedColormap
 import numpy as np
 from PIL import Image
+
+# Custom blue→red colormap for intensity (avoids white which blends with masked background)
+BLUE_RED_CMAP = LinearSegmentedColormap.from_list('blue_red', ['blue', 'red'], N=256)
 
 
 def load_lidar_png(path):
@@ -85,6 +89,11 @@ def visualize_lidar(lidar_dir, output_path=None, dpi=150):
     }
 
     data = {}
+
+    # Pre-load gt_ray_drop to use as mask for pred_intensity
+    gt_ray_drop_path = os.path.join(lidar_dir, 'gt_ray_drop.png')
+    gt_ray_drop_arr = load_lidar_png(gt_ray_drop_path) if os.path.isfile(gt_ray_drop_path) else None
+
     for fname, (title, kind) in files.items():
         fpath = os.path.join(lidar_dir, fname)
         if not os.path.isfile(fpath):
@@ -94,14 +103,21 @@ def visualize_lidar(lidar_dir, output_path=None, dpi=150):
 
         if kind == 'depth':
             vis = normalize_depth(img, clip_percentile=98)
+            if not fname.startswith('gt_'):
+                # Pred depth: mask with GT ray_drop for fair comparison
+                if gt_ray_drop_arr is not None:
+                    vis[gt_ray_drop_arr == 0] = np.nan
             cmap = 'viridis'
         elif kind == 'intensity':
-            # GT intensity: zero pixels = no return, show as NaN
-            # Pred intensity: nearly constant (broken), still show
             vis = normalize_intensity(img)
             if fname.startswith('gt_'):
+                # GT intensity: zero pixels = no return, show as NaN
                 vis[img == 0] = np.nan
-            cmap = 'gray'
+            else:
+                # Pred intensity: mask with GT ray_drop for fair comparison
+                if gt_ray_drop_arr is not None:
+                    vis[gt_ray_drop_arr == 0] = np.nan
+            cmap = BLUE_RED_CMAP
         elif kind == 'ray_drop':
             vis = img.astype(np.float32) / 255.0
             # ray_drop is binary: 0 = hit (no drop), 255 = drop
@@ -126,7 +142,7 @@ def visualize_lidar(lidar_dir, output_path=None, dpi=150):
              'gt_intensity.png', 'pred_intensity.png',
              'gt_ray_drop.png', 'pred_ray_drop.png']
 
-    fig, axes = plt.subplots(3, 2, figsize=(14, 8))
+    fig, axes = plt.subplots(6, 1, figsize=(12, 16))
 
     for ax, fname in zip(axes.flat, order):
         if fname in data:
