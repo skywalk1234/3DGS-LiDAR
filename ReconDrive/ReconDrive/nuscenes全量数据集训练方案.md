@@ -10,24 +10,27 @@
 # 1. 数据路径（服务器上的 nuscenes 路径）
 data_path: '/path/to/nuscenes'          # 原值: ./data/nuscenes/
 
-# 2. 版本切换为全量
-nuscenes_version: 'v1.0-trainval'        # 原值: v1.0-mini
+# 2. 版本切换为12Hz
+nuscenes_version: 'interp_12Hz_trainval'        # 原值: v1.0-mini
 
 # 3. 缓存目录（建议指到大磁盘路径）
 cache_dir: '/path/to/cache/nuscenes-trainval'  # 原值: ./work_dirs/cache_data/nuscenes-mini
 
-# 4. context_span 增大（全量场景更长，6 帧 ≈ 3 米间隔）
+# 4. 帧率切换为 12Hz（全量数据包含高频 sweeps）
+frame_rate: 12                           # 原值: 2
+
+# 5. context_span 增大（全量场景更长，12Hz 下 6 帧 ≈ 0.5s 间隔）
 context_span: 6                          # 原值: 1
 
-# 5. 训练 epoch 数
+# 6. 训练 epoch 数
 train_epoch: 10                          # 原值: 2
 
 # ===== 按需调整 =====
 
-# 6. GPU 数量（按服务器配置）
+# 7. GPU 数量（按服务器配置）
 devices: [0,1,2,3,4,5,6,7]              # 原值不变
 
-# 7. batch_size现在是1，可以增大一点
+# 8. batch_size 现在是 1，可以增大一点
 ```
 
 修改后效果（仅列出有变化的行）：
@@ -37,9 +40,10 @@ devices: [0,1,2,3,4,5,6,7]              # 原值不变
 ```yaml
 # 修改前                                # 修改后
 train_epoch: 2                          train_epoch: 10
+frame_rate: 2                           frame_rate: 12
 cache_dir: './work_dirs/cache_data/...' cache_dir: '/path/to/cache/nuscenes-trainval'
 data_path: './data/nuscenes/'           data_path: '/path/to/nuscenes'
-nuscenes_version: 'v1.0-mini'           nuscenes_version: 'v1.0-trainval'
+nuscenes_version: 'v1.0-mini'           nuscenes_version: ' interp_12Hz_trainval'
 context_span: 1                         context_span: 6
 ```
 
