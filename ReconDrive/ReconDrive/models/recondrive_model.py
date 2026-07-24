@@ -958,13 +958,13 @@ class ReconDrive_LITModelModule(pl.LightningModule):
 
     def validation_step(self, batch_input, batch_idx):
         self.stage = stage = 'val'
-        # Haibao: hardcode
-        context_span = 6
-        self.all_render_frame_ids = range(0, context_span)
-
-
         self.set_normal_params(batch_input)
         self.init_novel_view_mode()
+
+        # For context_span=1 (mini, 2 frames), use only frame 0 for checkpoint selection
+        # to avoid frame 1 (novel view) degrading the overall val/psnr metric
+        if self.context_span <= 1:
+            self.all_render_frame_ids = [0]
         batch_recontrast_data = self.get_recontrast_data(batch_input)
 
         batch_render_data = self.get_render_data(batch_input)
@@ -1008,12 +1008,9 @@ class ReconDrive_LITModelModule(pl.LightningModule):
 
     def test_step(self, batch_input, batch_idx):
         self.stage = stage = 'test'
-        # Haibao: hardcode
-        context_span = 6
-        self.all_render_frame_ids = range(0, context_span)
-
         self.set_normal_params(batch_input)
         self.init_novel_view_mode()
+        # test_step uses whatever frames set_normal_params detected from data
         batch_recontrast_data = self.get_recontrast_data(batch_input)
 
         batch_render_data = self.get_render_data(batch_input)
