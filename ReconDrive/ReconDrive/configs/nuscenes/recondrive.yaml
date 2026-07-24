@@ -1,7 +1,7 @@
 
 save_dir: './work_dirs/recondrive_training'
 seed: 1
-train_epoch: 2
+train_epoch: 20
 devices: [0,1,2,3,4,5,6,7]
 
 
@@ -47,7 +47,7 @@ model_cfg:
   # LiDAR loss weights
   lambda_lidar_depth: 1.0
   lambda_lidar_intensity: 0.1
-  lambda_lidar_raydrop: 0.01
+  lambda_lidar_raydrop: 0.1
   lidar_feat_dim: 16
 
   # Model checkpoint paths
