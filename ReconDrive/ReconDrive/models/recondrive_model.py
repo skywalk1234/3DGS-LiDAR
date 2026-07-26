@@ -2427,7 +2427,7 @@ class ReconDrive_LITModelModule(pl.LightningModule):
                 lpips_loss = self.lpips(pred, gt, normalize=True)
                 # lpips_loss = 0.0
                 l2_loss = ((pred - gt)**2)
-                sum_loss = 1 * l2_loss + 0.05 * lpips_loss
+                sum_loss = 1 * l2_loss + 0.2 * lpips_loss
                 gaussian_loss += compute_masked_loss(sum_loss, mask, eps=0.1)
                 count += 1
         return self.lambda_gaussian * gaussian_loss / count
