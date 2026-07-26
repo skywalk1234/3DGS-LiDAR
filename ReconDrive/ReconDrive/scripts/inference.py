@@ -317,6 +317,7 @@ def _process_scene_batch(model, scene_batch, device, gpu_id=0, save_renders=True
 
     scene_psnr_list, scene_ssim_list, scene_lpips_list = [], [], []
     lidar_depth_l2_list, lidar_depth_median_l2_list = [], []
+    lidar_delta_1_list, lidar_delta_2_list, lidar_delta_3_list = [], [], []
     lidar_intensity_rmse_list, lidar_ray_drop_acc_list = [], []
     lidar_chamfer_dist_list = []
     batch_count = 0
@@ -556,6 +557,18 @@ def _process_scene_batch(model, scene_batch, device, gpu_id=0, save_renders=True
                     # Median Depth L2
                     depth_median_l2 = depth_sq.median().item() if valid.any() else 0.0
 
+                    # δ accuracy (depth ratio thresholds)
+                    delta_1 = 0.0
+                    delta_2 = 0.0
+                    delta_3 = 0.0
+                    if valid.any():
+                        pred_d_valid = pred_depth[valid]
+                        gt_d_valid = gt_depth[valid]
+                        depth_ratio = torch.max(pred_d_valid / gt_d_valid, gt_d_valid / pred_d_valid)
+                        delta_1 = (depth_ratio < 1.25).float().mean().item()
+                        delta_2 = (depth_ratio < 1.25**2).float().mean().item()
+                        delta_3 = (depth_ratio < 1.25**3).float().mean().item()
+
                     # Intensity RMSE
                     intensity_sq = ((pred_intensity[valid] - gt_intensity[valid]) ** 2)
                     intensity_rmse = intensity_sq.mean().sqrt().item() if valid.any() else 0.0
@@ -595,11 +608,15 @@ def _process_scene_batch(model, scene_batch, device, gpu_id=0, save_renders=True
                         chamfer_dist = dist_g2p + dist_p2g
 
                     print(f"GPU {gpu_id}: LiDAR metrics - DepthL2: {depth_l2:.4f}, MedDepthL2: {depth_median_l2:.4f}, "
+                          f"δ1: {delta_1:.4f}, δ2: {delta_2:.4f}, δ3: {delta_3:.4f}, "
                           f"IntRMSE: {intensity_rmse:.4f}, RayDropAcc: {ray_drop_acc:.4f}, ChamferDist: {chamfer_dist:.4f}")
 
                     # Accumulate
                     lidar_depth_l2_list.append(depth_l2)
                     lidar_depth_median_l2_list.append(depth_median_l2)
+                    lidar_delta_1_list.append(delta_1)
+                    lidar_delta_2_list.append(delta_2)
+                    lidar_delta_3_list.append(delta_3)
                     lidar_intensity_rmse_list.append(intensity_rmse)
                     lidar_ray_drop_acc_list.append(ray_drop_acc)
                     lidar_chamfer_dist_list.append(chamfer_dist)
@@ -622,6 +639,9 @@ def _process_scene_batch(model, scene_batch, device, gpu_id=0, save_renders=True
             'depth_l2_std': np.std(lidar_depth_l2_list),
             'depth_median_l2': np.mean(lidar_depth_median_l2_list),
             'depth_median_l2_std': np.std(lidar_depth_median_l2_list),
+            'delta_1': np.mean(lidar_delta_1_list),
+            'delta_2': np.mean(lidar_delta_2_list),
+            'delta_3': np.mean(lidar_delta_3_list),
             'intensity_rmse': np.mean(lidar_intensity_rmse_list),
             'intensity_rmse_std': np.std(lidar_intensity_rmse_list),
             'ray_drop_acc': np.mean(lidar_ray_drop_acc_list),
@@ -699,12 +719,16 @@ def _run_single_gpu_inference(model, scene_dataloader, device, save_results=True
 
     # Aggregate LiDAR metrics across scenes
     lidar_depth_l2_all, lidar_depth_median_l2_all = [], []
+    lidar_delta_1_all, lidar_delta_2_all, lidar_delta_3_all = [], [], []
     lidar_intensity_rmse_all, lidar_ray_drop_acc_all, lidar_chamfer_dist_all = [], [], []
     for r in all_scene_results:
         m = r.get('metrics', {})
         if 'depth_l2' in m:
             lidar_depth_l2_all.append(m['depth_l2'])
             lidar_depth_median_l2_all.append(m['depth_median_l2'])
+            lidar_delta_1_all.append(m['delta_1'])
+            lidar_delta_2_all.append(m['delta_2'])
+            lidar_delta_3_all.append(m['delta_3'])
             lidar_intensity_rmse_all.append(m['intensity_rmse'])
             lidar_ray_drop_acc_all.append(m['ray_drop_acc'])
             lidar_chamfer_dist_all.append(m['chamfer_distance'])
@@ -735,6 +759,7 @@ def _run_single_gpu_inference(model, scene_dataloader, device, save_results=True
         print(f"\nLiDAR Metrics (scenes: {len(lidar_depth_l2_all)}):")
         print(f"  Depth L2: {np.mean(lidar_depth_l2_all):.4f} ± {np.std(lidar_depth_l2_all):.4f}")
         print(f"  Median Depth L2: {np.mean(lidar_depth_median_l2_all):.4f} ± {np.std(lidar_depth_median_l2_all):.4f}")
+        print(f"  δ1: {np.mean(lidar_delta_1_all):.4f}, δ2: {np.mean(lidar_delta_2_all):.4f}, δ3: {np.mean(lidar_delta_3_all):.4f}")
         print(f"  Intensity RMSE: {np.mean(lidar_intensity_rmse_all):.4f} ± {np.std(lidar_intensity_rmse_all):.4f}")
         print(f"  Ray Drop Acc: {np.mean(lidar_ray_drop_acc_all):.4f} ± {np.std(lidar_ray_drop_acc_all):.4f}")
         print(f"  Chamfer Distance: {np.mean(lidar_chamfer_dist_all):.4f} ± {np.std(lidar_chamfer_dist_all):.4f}")
@@ -749,6 +774,9 @@ def _run_single_gpu_inference(model, scene_dataloader, device, save_results=True
                 'depth_l2_std': np.std(lidar_depth_l2_all),
                 'depth_median_l2': np.mean(lidar_depth_median_l2_all),
                 'depth_median_l2_std': np.std(lidar_depth_median_l2_all),
+                'delta_1': np.mean(lidar_delta_1_all),
+                'delta_2': np.mean(lidar_delta_2_all),
+                'delta_3': np.mean(lidar_delta_3_all),
                 'intensity_rmse': np.mean(lidar_intensity_rmse_all),
                 'intensity_rmse_std': np.std(lidar_intensity_rmse_all),
                 'ray_drop_acc': np.mean(lidar_ray_drop_acc_all),
