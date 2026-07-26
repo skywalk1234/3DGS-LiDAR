@@ -56,6 +56,13 @@ model_cfg:
   sam2_model_cfg: 'configs/sam2.1/sam2.1_hiera_s.yaml'
   sam2_dir: null  # Set to SAM2 installation directory, or leave null to auto-detect
 
+  # VGGT backbone fine-tuning configuration
+  # Number of last frame+global blocks to fully unfreeze (not just LoRA).
+  # Aggregator has 24 frame_blocks + 24 global_blocks (48 total).
+  # Set to 0 to keep all blocks LoRA-only (current default).
+  # Recommended: 2-6 for partial fine-tuning.
+  unfreeze_last_n_blocks: 2
+
 
 data_cfg:
   data_path: './data/nuscenes/'

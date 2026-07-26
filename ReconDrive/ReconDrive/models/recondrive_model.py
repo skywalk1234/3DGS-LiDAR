@@ -140,7 +140,7 @@ def load_lora_state_dict(model, state_dict):
 
 
 class ReconDriveModel(torch.nn.Module):
-    def __init__(self, sh_degree, min_depth, max_depth, vggt_checkpoint="./checkpoints/vggt.pt", lidar_feat_dim=16):
+    def __init__(self, sh_degree, min_depth, max_depth, vggt_checkpoint="./checkpoints/vggt.pt", lidar_feat_dim=16, unfreeze_last_n_blocks=0):
         super(ReconDriveModel, self).__init__()
         self.img_size = 518
         self.patch_size = 14
@@ -149,6 +149,7 @@ class ReconDriveModel(torch.nn.Module):
         self.min_depth = min_depth
         self.max_depth = max_depth
         self.lidar_feat_dim = lidar_feat_dim
+        self.unfreeze_last_n_blocks = unfreeze_last_n_blocks
 
         vggt_model = VGGT()
         # VGGT_URL = "https://huggingface.co/facebook/VGGT-1B/resolve/main/model.pt"
@@ -160,6 +161,11 @@ class ReconDriveModel(torch.nn.Module):
         # self.aggregator = vggt_model.aggregator
         self.aggregator = apply_lora(vggt_model.aggregator,layer_names=['qkv','proj','fc1','fc2'], dropout=0.05)
         verify_frozen_parameters(self.aggregator)
+
+        # Unfreeze the last N blocks' original weights for full fine-tuning
+        if self.unfreeze_last_n_blocks > 0:
+            self._unfreeze_last_n_blocks(self.unfreeze_last_n_blocks)
+
         # self.depth_head = DPTHead(dim_in=2 * self.embed_dim, output_dim=2, activation="sigmoid", conf_activation="expp1")
         self.depth_head = vggt_model.depth_head
         
@@ -266,6 +272,51 @@ class ReconDriveModel(torch.nn.Module):
         for param in self.parameters():
             param.requires_grad = True
         print("All parameters have been unfrozen.")
+
+    def _unfreeze_last_n_blocks(self, n):
+        """
+        Unfreeze the original weights in the last N frame+global blocks of the aggregator.
+        The aggregator has `depth` frame_blocks and `depth` global_blocks (default depth=24),
+        organized as alternating frame→global attention blocks.
+
+        This allows the last N*2 blocks to be fully fine-tuned (not just LoRA),
+        while earlier blocks still use LoRA adaptation only.
+        """
+        aggregator = self.aggregator
+        depth = aggregator.depth
+
+        if n > depth:
+            print(f"Warning: n={n} > aggregator depth={depth}, clamping to {depth}")
+            n = depth
+
+        blocks_to_unfreeze = []
+        # Unfreeze last N frame blocks
+        for block in aggregator.frame_blocks[-n:]:
+            blocks_to_unfreeze.append(block)
+        # Unfreeze last N global blocks
+        for block in aggregator.global_blocks[-n:]:
+            blocks_to_unfreeze.append(block)
+
+        # Count parameters
+        total_unfrozen = 0
+        for block in blocks_to_unfreeze:
+            for module in block.modules():
+                if isinstance(module, LoRALinear):
+                    # Unfreeze the original linear weights (not just LoRA adapters)
+                    module.linear.weight.requires_grad = True
+                    total_unfrozen += module.linear.weight.numel()
+                    if module.linear.bias is not None:
+                        module.linear.bias.requires_grad = True
+                        total_unfrozen += module.linear.bias.numel()
+                elif isinstance(module, nn.LayerNorm):
+                    # Unfreeze LayerNorm parameters
+                    for param in module.parameters():
+                        param.requires_grad = True
+                        total_unfrozen += param.numel()
+
+        print(f"Unfrozen original weights in last {n} frame blocks and {n} global blocks")
+        print(f"  Total unfrozen parameters: {total_unfrozen:,}")
+        print(f"  Blocks {depth-n} to {depth-1} (0-indexed) in both frame and global lists")
 
     def forward(self, images):
         '''
@@ -584,7 +635,8 @@ class ReconDrive_LITModelModule(pl.LightningModule):
         self.save_dir = save_dir
         vggt_checkpoint = getattr(self, 'vggt_checkpoint', './checkpoints/vggt.pt')
         lidar_feat_dim = getattr(self, 'lidar_feat_dim', 16)
-        self.model = ReconDriveModel(sh_degree=self.sh_degree, min_depth=self.min_depth, max_depth=self.max_depth, vggt_checkpoint=vggt_checkpoint, lidar_feat_dim=lidar_feat_dim) 
+        unfreeze_last_n_blocks = getattr(self, 'unfreeze_last_n_blocks', 0)
+        self.model = ReconDriveModel(sh_degree=self.sh_degree, min_depth=self.min_depth, max_depth=self.max_depth, vggt_checkpoint=vggt_checkpoint, lidar_feat_dim=lidar_feat_dim, unfreeze_last_n_blocks=unfreeze_last_n_blocks) 
         self.lidar_decoder = LidarDecoder(feature_dim=self.model.lidar_feat_dim)
         self.lpips = LPIPS(net="vgg")
         self.ssim_fn = SSIMLoss(window_size=11,reduction='none')
