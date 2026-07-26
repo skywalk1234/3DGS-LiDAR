@@ -1197,15 +1197,20 @@ class ReconDrive_LITModelModule(pl.LightningModule):
         return True
                         
     def configure_optimizers(self):
-        # Collect all trainable parameters (simplified, no parameter groups)
-        trainable_params = []
-        trainable_param_names = []
+        # Separate trainable parameters into backbone (aggregator) and head groups
+        backbone_params = []
+        head_params = []
+        backbone_names = []
+        head_names = []
 
-        for name, parameters in self.model.named_parameters():
-            if parameters.requires_grad:
-                trainable_params.append(parameters)
-                trainable_param_names.append(name)
-                print(f'Training parameter: {name}')
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                if 'aggregator' in name:
+                    backbone_params.append(param)
+                    backbone_names.append(name)
+                else:
+                    head_params.append(param)
+                    head_names.append(name)
 
         if self.auto_scale_lr:
             num_devices = self.trainer.num_devices
@@ -1214,29 +1219,33 @@ class ReconDrive_LITModelModule(pl.LightningModule):
         else:
             base_lr = self.learning_rate
 
-        print(f"\nOptimizer configuration (simplified):")
-        print(f"  Total trainable parameters: {len(trainable_params)}")
-        print(f"  Learning rate: {base_lr}")
-        print(f"  Using single learning rate for all parameters")
-        
-        # Verify we're training depth_head and gs_head
-        depth_head_count = sum(1 for name in trainable_param_names if 'depth_head' in name)
-        gs_head_count = sum(1 for name in trainable_param_names if 'gs_head' in name)
-        other_count = len(trainable_param_names) - depth_head_count - gs_head_count
-        print(f"  - depth_head parameters: {depth_head_count}")
-        print(f"  - gs_head parameters: {gs_head_count}")
-        if other_count > 0:
-            print(f"  - WARNING: {other_count} other parameters are also trainable")
+        backbone_lr_scale = getattr(self, 'backbone_lr_scale', 0.3)
+        backbone_lr = base_lr * backbone_lr_scale
 
-        if not trainable_params:
+        print(f"\nOptimizer configuration (parameter groups):")
+        print(f"  Base learning rate: {base_lr}")
+        print(f"  Backbone LR scale: {backbone_lr_scale} -> backbone LR: {backbone_lr:.8f}")
+        print(f"  Head parameters: {len(head_params)}")
+        print(f"  Backbone parameters: {len(backbone_params)}")
+
+        for name in head_names:
+            print(f'  [HEAD] {name}')
+        for name in backbone_names:
+            print(f'  [BACKBONE] {name}')
+
+        # Build parameter groups with per-group LR
+        param_groups = []
+        if head_params:
+            param_groups.append({'params': head_params, 'lr': base_lr, 'name': 'heads'})
+        if backbone_params:
+            param_groups.append({'params': backbone_params, 'lr': backbone_lr, 'name': 'backbone'})
+
+        if not param_groups:
             print("ERROR: No trainable parameters found!")
-            # Create dummy parameter to avoid crash
-            trainable_params = [torch.nn.Parameter(torch.zeros(1))]
+            param_groups = [{'params': [torch.nn.Parameter(torch.zeros(1))], 'lr': base_lr}]
 
-        # Create simple optimizer without parameter groups
-        optimizer = optim.AdamW(trainable_params, lr=base_lr, betas=(0.9,0.98), eps=1e-7, weight_decay=self.weight_decay)
+        optimizer = optim.AdamW(param_groups, lr=base_lr, betas=(0.9,0.98), eps=1e-7, weight_decay=self.weight_decay)
 
-        # scheduler = torch.optim.lr_scheduler.StepLR(optimizer,step_size=self.scheduler_step_size,gamma=self.scheduler_gamma)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
                     optimizer,
                     T_0=self.lr_restart_epoch,  
