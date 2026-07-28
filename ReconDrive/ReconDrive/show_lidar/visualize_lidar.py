@@ -7,7 +7,7 @@ as a side-by-side 2x3 grid with proper color mapping.
 
 Usage:
   # Single lidar folder
-  python show_lidar/visualize_lidar.py /data/mr/project/ReconDrive/ReconDrive/work_dirs/inference_trained_results_v4/scene-0061/sample_0000/lidar
+  python show_lidar/visualize_lidar.py /data/mr/project/ReconDrive/ReconDrive/work_dirs/inference_trained_results_v8/scene-0061/sample_0000/lidar
 
   # Multiple folders
   python show_lidar/visualize_lidar.py <folder1> <folder2> ...
@@ -120,8 +120,9 @@ def visualize_lidar(lidar_dir, output_path=None, dpi=150):
             cmap = BLUE_RED_CMAP
         elif kind == 'ray_drop':
             vis = img.astype(np.float32) / 255.0
-            # ray_drop is binary: 0 = hit (no drop), 255 = drop
-            # Show as-is, no NaN masking
+            if not fname.startswith('gt_'):
+                # Binarize pred at 0.5 threshold for fair comparison with GT
+                vis = (vis >= 0.5).astype(np.float32)
             cmap = 'gray'
         else:
             vis = img
