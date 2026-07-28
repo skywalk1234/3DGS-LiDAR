@@ -803,9 +803,9 @@ def save_lidar_cam_overlays(lidar_gt, lidar_out, batch_render_data, batch_splati
         # So depth > 0 is already equivalent to ray_drop > 0.5 (redundant, kept for clarity)
         gt_valid = lidar_gt['gt_depth'][0].reshape(-1) > 0
 
-        pred_ray_drop = (torch.sigmoid(lidar_out['ray_drop_logits'][0]).reshape(-1) > 0.5)
+        pred_ray_drop = (torch.sigmoid(lidar_out['ray_drop_logits'][0]).reshape(-1) < 0.5)
         pred_valid = lidar_out['depth'][0].reshape(-1) > 0
-        pred_valid = pred_valid & (~pred_ray_drop)
+        pred_valid = pred_valid
 
         gt_pts_valid = gt_pts_flat[gt_valid]
         pred_pts_valid = pred_pts_flat[pred_valid]
