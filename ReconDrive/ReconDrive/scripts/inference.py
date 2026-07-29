@@ -517,13 +517,7 @@ def _process_scene_batch(model, scene_batch, device, gpu_id=0, save_renders=True
                     Image.fromarray(arr_2d).save(path)
 
                 # Predicted depth [B, H, W, 1]
-                pred_depth_exp = lidar_out['depth'][0]  # expected depth [H, W, 1]
-                pred_depth_exp_np = pred_depth_exp.detach().cpu().numpy()
-                depth_mm = np.clip(pred_depth_exp_np * 1000, 0, 65535).astype(np.uint16)
-                _save_lidar_map(depth_mm, os.path.join(lidar_dir, 'pred_depth_expected.png'))
-
-                # Use median depth for evaluation (SplatAD-style inference)
-                pred_depth = lidar_out['median_depth'][0]  # median depth [H, W, 1]
+                pred_depth = lidar_out['depth'][0]  # [H, W, 1]
                 pred_depth_np = pred_depth.detach().cpu().numpy()
                 depth_mm = np.clip(pred_depth_np * 1000, 0, 65535).astype(np.uint16)
                 _save_lidar_map(depth_mm, os.path.join(lidar_dir, 'pred_depth.png'))

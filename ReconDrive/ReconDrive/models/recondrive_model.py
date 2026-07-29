@@ -861,7 +861,7 @@ class ReconDrive_LITModelModule(pl.LightningModule):
             return None
 
         B = recontrast_data['xyz'].shape[0]
-        depth_list, median_depth_list, intensity_list, raydrop_list = [], [], [], []
+        depth_list, intensity_list, raydrop_list = [], [], []
 
         for bid in range(B):
             rp = lidar_data['raster_pts'][bid]
@@ -878,7 +878,7 @@ class ReconDrive_LITModelModule(pl.LightningModule):
                 az_res = az_res[bid]
             az_res = az_res.item() if hasattr(az_res, 'item') else float(az_res)
 
-            render, alpha, _, meta = lidar_rasterization(
+            render, alpha, _, _ = lidar_rasterization(
                 means=recontrast_data['xyz'][bid],
                 quats=recontrast_data['rot_maps'][bid],
                 scales=recontrast_data['scale_maps'][bid],
@@ -896,8 +896,6 @@ class ReconDrive_LITModelModule(pl.LightningModule):
             )
 
             depth = render[..., -1:]
-            median_depth = meta["median_depths"]
-            median_depth = median_depth + (alpha <= 0.5) * (depth / alpha.clamp_min(1e-10))
             features = render[..., :-1]
 
             rp_deg = torch.deg2rad(rp[..., :2])
@@ -910,13 +908,11 @@ class ReconDrive_LITModelModule(pl.LightningModule):
             intensity, ray_drop_logits = self.lidar_decoder(features, ray_dir)
 
             depth_list.append(depth)
-            median_depth_list.append(median_depth)
             intensity_list.append(intensity)
             raydrop_list.append(ray_drop_logits)
 
         return {
             "depth": torch.stack(depth_list),
-            "median_depth": torch.stack(median_depth_list),
             "intensity": torch.stack(intensity_list).sigmoid(),
             "ray_drop_logits": torch.stack(raydrop_list),
         }
