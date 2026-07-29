@@ -628,6 +628,14 @@ def _process_scene_batch(model, scene_batch, device, gpu_id=0, save_renders=True
                     lidar_chamfer_dist_list.append(chamfer_dist)
             # -------------------------
 
+            # --- Save LiDAR-camera overlays ---
+            if lidar_out is not None and lidar_gt is not None and output_dir:
+                save_lidar_cam_overlays(
+                    lidar_gt, lidar_out, batch_render_data, batch_splating_data,
+                    scene_name, actual_sample_idx, output_dir, num_cams=num_cams,
+                )
+            # -------------------------
+
             # Aggregate scene-level metrics (keep modes separate)
             scene_psnr_list.extend(recon_psnr + novel_psnr)
             scene_ssim_list.extend(recon_ssim + novel_ssim)
@@ -688,6 +696,176 @@ def _process_scene_batch(model, scene_batch, device, gpu_id=0, save_renders=True
             'lpips_list': novel_lpips
         }
     }
+
+
+def save_lidar_cam_overlays(lidar_gt, lidar_out, batch_render_data, batch_splating_data,
+                            scene_name, sample_idx, output_dir, num_cams=6, max_depth=80.0,
+                            point_radius=2, alpha=0.8):
+    """
+    Project GT and Pred LiDAR points to each camera view and overlay on GT images.
+
+    Args:
+        lidar_gt: dict with 'raster_pts' [B,H,W,4], 'viewmat' [B,4,4], 'gt_depth' [B,H,W,1]
+        lidar_out: dict with 'depth' [B,H,W,1] (predicted depth)
+        batch_render_data: dict with ('e2c_extr', f, c) and ('K', f, c)
+        batch_splating_data: dict with ('groudtruth', f, c) for GT camera images
+        scene_name, sample_idx: for output path naming
+        output_dir: root output directory
+    """
+    global_sample_idx = sample_idx
+    lidar_cam_dir = os.path.join(output_dir, scene_name, f'sample_{global_sample_idx:04d}', 'lidar_cam')
+    os.makedirs(lidar_cam_dir, exist_ok=True)
+
+    H, W = lidar_gt['raster_pts'].shape[1:3]
+
+    # Convert raster_pts (az, el, depth) → 3D points (x,y,z) in LiDAR frame
+    # raster_pts[..., 0] = azimuth in degrees, [... ,1] = elevation in degrees
+    raster_pts = lidar_gt['raster_pts']  # [B, H, W, 4]
+    az_rad = torch.deg2rad(raster_pts[..., 0:1])   # [B, H, W, 1]
+    el_rad = torch.deg2rad(raster_pts[..., 1:2])   # [B, H, W, 1]
+    cos_el = torch.cos(el_rad)
+
+    # GT depth [B, H, W, 1]
+    gt_depth = lidar_gt['gt_depth']
+    # Pred depth [B, H, W, 1]
+    pred_depth = lidar_out['depth']
+
+    # 3D points in LiDAR frame: [B, H, W, 3]
+    gt_pts_3d = torch.cat([
+        gt_depth * cos_el * torch.cos(az_rad),
+        gt_depth * cos_el * torch.sin(az_rad),
+        gt_depth * torch.sin(el_rad),
+    ], dim=-1)
+
+    pred_pts_3d = torch.cat([
+        pred_depth * cos_el * torch.cos(az_rad),
+        pred_depth * cos_el * torch.sin(az_rad),
+        pred_depth * torch.sin(el_rad),
+    ], dim=-1)
+
+    # LiDAR → ego transform: inv(viewmat)
+    # viewmat is ego_to_lidar, so lidar_to_ego = inv(viewmat)
+    lidar_to_ego = torch.linalg.inv(lidar_gt['viewmat'])  # [B, 4, 4]
+
+    # Helper to project points in LiDAR frame to a camera
+    def _project_to_camera(pts_3d_lidar, e2c_extr, K, target_h, target_w):
+        """pts_3d_lidar: [N, 3] in LiDAR frame → [M, 2] pixel coords and [M] depths"""
+        device = pts_3d_lidar.device
+        N = pts_3d_lidar.shape[0]
+
+        # Force 2D [4, 4] matrices (handles [1,4,4], [4,4], or any shape with 16 elements)
+        e2c = e2c_extr.reshape(4, 4)
+        l2e = lidar_to_ego.reshape(4, 4)
+        cam_T_lidar = torch.mm(e2c, l2e)  # [4, 4] lidar→camera transform
+
+        # pts_h: [N, 4]
+        ones = torch.ones(N, 1, device=device, dtype=pts_3d_lidar.dtype)
+        pts_h = torch.cat([pts_3d_lidar, ones], dim=-1)
+
+        # Transform: [N, 4] = [N, 4] @ [4, 4]
+        pts_cam = torch.mm(pts_h, cam_T_lidar.T)  # [N, 4]
+        pts_cam = pts_cam[:, :3]  # [N, 3]
+
+        # Filter: in front of camera
+        front = pts_cam[:, 2] > 0
+        pts_front = pts_cam[front]
+
+        if pts_front.shape[0] == 0:
+            return np.zeros((0, 2)), np.zeros(0)
+
+        # Project with intrinsics (post-multiply to avoid .T on >2D)
+        # uv_h = pts_front @ K.T  →  [M, 3] = [M, 3] @ [3, 3]
+        uv_h = torch.mm(pts_front, K.T)  # [M, 3]
+        uv_h[:, :2] /= uv_h[:, 2:3]
+        u, v, z = uv_h[:, 0], uv_h[:, 1], uv_h[:, 2]
+
+        in_bounds = (u >= 0) & (u < target_w) & (v >= 0) & (v < target_h)
+        u, v, z = u[in_bounds], v[in_bounds], z[in_bounds]
+        return torch.stack([u, v], dim=-1).cpu().numpy(), z.cpu().numpy()
+
+    for cam_id in range(num_cams):
+        frame_id = 0  # Use frame 0 (reconstruction frame)
+        gt_key = ('groudtruth', frame_id, cam_id)
+        e2c_key = ('e2c_extr', frame_id, cam_id)
+        K_key = ('K', frame_id, cam_id)
+
+        if gt_key not in batch_splating_data or e2c_key not in batch_render_data:
+            continue
+
+        # GT camera image [B, 3, H, W]
+        gt_img_t = batch_splating_data[gt_key][0]  # [3, H, W]
+        H_img, W_img = gt_img_t.shape[1], gt_img_t.shape[2]
+        gt_np = gt_img_t.permute(1, 2, 0).clamp(0, 1).cpu().numpy()  # [H, W, 3]
+
+        e2c_extr = batch_render_data[e2c_key][0:1]  # [1, 4, 4]
+        K = batch_render_data[K_key][0, :3, :3]     # [3, 3]
+
+        # Flatten LiDAR points to [H*W, 3]
+        gt_pts_flat = gt_pts_3d[0].reshape(-1, 3)   # [H*W, 3]
+        pred_pts_flat = pred_pts_3d[0].reshape(-1, 3)
+
+        # Valid masks: depth > 0 AND not ray-dropped
+        # NOTE: gt_ray_drop uses 1.0=valid(point exists), 0.0=dropped(no return)
+        # So depth > 0 is already equivalent to ray_drop > 0.5 (redundant, kept for clarity)
+        gt_valid = lidar_gt['gt_depth'][0].reshape(-1) > 0
+
+        pred_ray_drop = (torch.sigmoid(lidar_out['ray_drop_logits'][0]).reshape(-1) < 0.5)
+        pred_valid = lidar_out['depth'][0].reshape(-1) > 0
+        pred_valid = pred_valid
+
+        gt_pts_valid = gt_pts_flat[gt_valid]
+        pred_pts_valid = pred_pts_flat[pred_valid]
+
+        # Project GT points
+        gt_uv, gt_z = _project_to_camera(gt_pts_valid, e2c_extr, K, H_img, W_img)
+        # Project Pred points
+        pred_uv, pred_z = _project_to_camera(pred_pts_valid, e2c_extr, K, H_img, W_img)
+
+        def _make_overlay(base_img, uv, z, path):
+            """Overlay depth-colored points on base image and save."""
+            overlay = base_img.copy()
+            h, w = overlay.shape[:2]
+
+            if len(uv) == 0:
+                Image.fromarray((overlay * 255).astype(np.uint8)).save(path)
+                return
+
+            # Color by depth: blue(near) → green → red(far)
+            depth_norm = np.clip(z / max_depth, 0, 1)
+            colors = np.zeros((len(z), 3))
+            colors[:, 0] = depth_norm
+            colors[:, 1] = 1.0 - np.abs(depth_norm - 0.5) * 2
+            colors[:, 2] = 1.0 - depth_norm
+            colors = np.clip(colors, 0, 1)
+
+            u_c = np.round(uv[:, 0]).astype(int)
+            v_c = np.round(uv[:, 1]).astype(int)
+
+            # Sort by depth descending (nearer on top)
+            order = np.argsort(-z)
+            u_c, v_c, colors = u_c[order], v_c[order], colors[order]
+
+            for i in range(len(u_c)):
+                u_pt, v_pt = u_c[i], v_c[i]
+                col = colors[i]
+                for dy in range(-point_radius, point_radius + 1):
+                    for dx in range(-point_radius, point_radius + 1):
+                        if dx*dx + dy*dy <= point_radius*point_radius:
+                            ud, vd = u_pt + dx, v_pt + dy
+                            if 0 <= ud < w and 0 <= vd < h:
+                                overlay[vd, ud] = (1 - alpha) * overlay[vd, ud] + alpha * col
+
+            Image.fromarray((np.clip(overlay, 0, 1) * 255).astype(np.uint8)).save(path)
+
+        # Save GT overlay
+        gt_out = os.path.join(lidar_cam_dir, f'cam_{cam_id}_gt_lidar_overlay.png')
+        _make_overlay(gt_np, gt_uv, gt_z, gt_out)
+
+        # Save Pred overlay
+        pred_out = os.path.join(lidar_cam_dir, f'cam_{cam_id}_pred_lidar_overlay.png')
+        _make_overlay(gt_np, pred_uv, pred_z, pred_out)
+
+        print(f"  GPU {0}: lidar_cam cam_{cam_id}: GT={len(gt_uv)}pts, Pred={len(pred_uv)}pts")
 
 
 def _run_single_gpu_inference(model, scene_dataloader, device, save_results=True, output_dir=None, novel_distances=[1.0, 2.0], eval_resolution='280x518'):
@@ -905,6 +1083,7 @@ def main():
     parser.add_argument('--restore_ckpt', type=str, required=True, help='Checkpoint path')
     parser.add_argument('--output_dir', type=str, default=None, help='Output directory for results')
     parser.add_argument('--max_scenes', type=int, default=None, help='Maximum number of scenes to process (default: all scenes)')
+    parser.add_argument('--scene', type=str, default=None, help='Specific scene name to process (e.g., scene-0061). If set, only this scene is processed.')
     parser.add_argument('--device', type=str, default=None, help='Device to use (e.g., cuda:0)')
 
     parser.add_argument('--no_renders', action='store_true', help='Disable saving rendered images and novel views')
@@ -979,9 +1158,19 @@ def main():
     scene_dataloader = data_module.test_scene_dataloader()
     total_scenes = len(scene_dataloader)
     
-    if args.max_scenes:
+    if args.scene:
+        print(f"Filtering to scene: {args.scene}")
+        scene_list = []
+        for scene_batch in scene_dataloader:
+            if scene_batch['scene_name'] == args.scene:
+                scene_list.append(scene_batch)
+                break
+        if not scene_list:
+            print(f"[ERROR] Scene '{args.scene}' not found in dataset!")
+            sys.exit(1)
+        scene_dataloader = scene_list
+    elif args.max_scenes:
         print(f"Limiting to {args.max_scenes} scenes (out of {total_scenes})")
-        # Limit scenes if requested
         scene_list = []
         for i, scene_batch in enumerate(scene_dataloader):
             if i >= args.max_scenes:
