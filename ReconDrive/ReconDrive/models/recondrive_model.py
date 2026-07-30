@@ -38,6 +38,7 @@ from models.vggt.models.vggt import VGGT
 from models.vggt.heads.dpt_head import DPTHead
 from models.vggt.heads.gs_dpt_head import VGGT_DPT_GS_Head
 from models.lidar_decoder import LidarDecoder
+from models.lidar_conditioning import LidarFeatureBuilder, DepthResidualHead, LidarFeatResidualHead
 from models.gaussian_util import render, focal2fov, getProjectionMatrix, depth2pc, pc2depth, rotate_sh, quat_multiply
 from models.loss_util import compute_photometric_loss, compute_masked_loss, compute_edg_smooth_loss, compute_lidar_loss
 from utils.visual_util import predictions_to_glb
@@ -638,6 +639,16 @@ class ReconDrive_LITModelModule(pl.LightningModule):
         unfreeze_last_n_blocks = getattr(self, 'unfreeze_last_n_blocks', 0)
         self.model = ReconDriveModel(sh_degree=self.sh_degree, min_depth=self.min_depth, max_depth=self.max_depth, vggt_checkpoint=vggt_checkpoint, lidar_feat_dim=lidar_feat_dim, unfreeze_last_n_blocks=unfreeze_last_n_blocks) 
         self.lidar_decoder = LidarDecoder(feature_dim=self.model.lidar_feat_dim)
+        # LiDAR conditioning modules
+        self.lidar_feature_builder = LidarFeatureBuilder(
+            min_depth=getattr(self, 'min_depth', 1.5),
+            max_depth=getattr(self, 'max_depth', 110.0),
+        )
+        self.depth_residual_head = DepthResidualHead(in_channels=4, hidden=32)
+        self.lidar_feat_residual_head = LidarFeatResidualHead(
+            lidar_feat_dim=getattr(self, 'lidar_feat_dim', 16),
+        )
+        self.lambda_depth_direct = getattr(self, 'lambda_depth_direct', 1.0)
         self.lpips = LPIPS(net="vgg")
         self.ssim_fn = SSIMLoss(window_size=11,reduction='none')
         self.l1_fn = torch.nn.L1Loss(reduction='none')
@@ -925,6 +936,20 @@ class ReconDrive_LITModelModule(pl.LightningModule):
 
         batch_recontrast_data = self.get_recontrast_data(batch_input, batch_idx)
 
+        # ===== 新增稀疏深度 Loss (仅训练) =====
+        loss_depth_direct = torch.tensor(0.0, device=self.device)
+        if hasattr(self, '_lidar_proj_data') and self._lidar_proj_data is not None:
+            ld = self._lidar_proj_data
+            mask = ld['proj_mask']  # [B*V, 1, H, W]
+            if mask.sum() > 0:
+                loss_depth_direct = F.l1_loss(
+                    ld['depth_maps_before'][mask.bool()],
+                    ld['proj_depth'][mask.bool()],
+                ) * self.lambda_depth_direct
+        self.log(f'{stage}/depth_direct', loss_depth_direct.item(),
+                 on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
+        # ===== 结束 =====
+
         loss_norm = self.compute_norm_loss(batch_recontrast_data)
 
         batch_render_data = self.get_render_data(batch_input)
@@ -964,7 +989,7 @@ class ReconDrive_LITModelModule(pl.LightningModule):
         if loss_lidar.item() > 0:
             self.log(f'{stage}/lidar', loss_lidar.item(), on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
 
-        loss_all = loss_gaussian + loss_depth + loss_project + loss_norm + loss_lidar
+        loss_all = loss_gaussian + loss_depth + loss_project + loss_norm + loss_lidar + loss_depth_direct
         psnr, ssim, lpips = self.compute_reconstruction_metrics(batch_splating_data,stage)
 
         del batch_input, batch_recontrast_data, batch_render_data, batch_render_project_data, batch_splating_data, psnr, ssim, lpips
@@ -1019,6 +1044,21 @@ class ReconDrive_LITModelModule(pl.LightningModule):
             self.all_render_frame_ids = [0]
         batch_recontrast_data = self.get_recontrast_data(batch_input)
 
+        # ===== 稀疏深度 Loss (验证) =====
+        loss_depth_direct = torch.tensor(0.0, device=self.device)
+        if hasattr(self, '_lidar_proj_data') and self._lidar_proj_data is not None:
+            ld = self._lidar_proj_data
+            mask = ld['proj_mask']
+            if mask.sum() > 0:
+                with torch.no_grad():
+                    loss_depth_direct = F.l1_loss(
+                        ld['depth_maps_before'][mask.bool()],
+                        ld['proj_depth'][mask.bool()],
+                    ) * self.lambda_depth_direct
+        self.log(f'{stage}/depth_direct', loss_depth_direct.item(),
+                 on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
+        # ===== 结束 =====
+
         batch_render_data = self.get_render_data(batch_input)
 
         loss_norm = self.compute_norm_loss(batch_recontrast_data)
@@ -1051,7 +1091,7 @@ class ReconDrive_LITModelModule(pl.LightningModule):
             self.log(f'{stage}/lidar', loss_lidar.item(), on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
 
         # Exclude projection loss from total loss
-        loss_all = loss_gaussian + loss_depth + loss_norm + loss_project + loss_lidar
+        loss_all = loss_gaussian + loss_depth + loss_norm + loss_project + loss_lidar + loss_depth_direct
         psnr, ssim, lpips = self.compute_reconstruction_metrics(batch_splating_data,stage)
 
         del batch_input,batch_recontrast_data, batch_render_data, batch_render_project_data, batch_splating_data, psnr, ssim, lpips
@@ -1509,6 +1549,79 @@ class ReconDrive_LITModelModule(pl.LightningModule):
         frame_camrea = depth_maps.shape[1]
 
         c2e_extr_list = torch.stack(c2e_extr_list, dim=1) # b, s, 4, 4
+
+        # ===== 新增: LiDAR 残差修正 + 稀疏深度监督 =====
+        self._lidar_proj_data = None
+        lidar_data = data_dict.get('lidar', {})
+        if lidar_data and 'projected_depth_f0' in lidar_data:
+            try:
+                V = depth_maps.shape[1]  # number of context views (6 or 12)
+                has_ctx_lidar = 'projected_depth_fn' in lidar_data and V > depth_maps.shape[1] // 2
+
+                # Concatenate frame 0 and frame context_span projections
+                if has_ctx_lidar and V > 6:
+                    proj_depth = torch.cat([
+                        lidar_data['projected_depth_f0'].float(),
+                        lidar_data['projected_depth_fn'].float(),
+                    ], dim=1)  # [B, V, H, W]
+                    proj_intensity = torch.cat([
+                        lidar_data['projected_intensity_f0'].float(),
+                        lidar_data['projected_intensity_fn'].float(),
+                    ], dim=1)
+                    proj_mask = torch.cat([
+                        lidar_data['projected_mask_f0'].float(),
+                        lidar_data['projected_mask_fn'].float(),
+                    ], dim=1)
+                else:
+                    proj_depth = lidar_data['projected_depth_f0'].float()  # [B, 6, H, W]
+                    proj_intensity = lidar_data['projected_intensity_f0'].float()
+                    proj_mask = lidar_data['projected_mask_f0'].float()
+                    # If V > 6 but no ctx lidar, pad with zeros
+                    if V > 6:
+                        B = proj_depth.shape[0]
+                        pad = torch.zeros(B, V - 6, self.height, self.width, device=proj_depth.device)
+                        proj_depth = torch.cat([proj_depth, pad], dim=1)
+                        proj_intensity = torch.cat([proj_intensity, pad], dim=1)
+                        proj_mask = torch.cat([proj_mask, pad], dim=1)
+
+                # Move to correct device if needed
+                proj_depth = proj_depth.to(depth_maps.device)
+                proj_intensity = proj_intensity.to(depth_maps.device)
+                proj_mask = proj_mask.to(depth_maps.device)
+
+                # Flatten to [B*V, 1, H, W] for CNN heads
+                bv_depth = rearrange(depth_maps, 'b v h w d -> (b v) d h w')  # [B*V, 1, H, W]
+                bv_proj_d = rearrange(proj_depth, 'b v h w -> (b v) () h w')
+                bv_proj_i = rearrange(proj_intensity, 'b v h w -> (b v) () h w')
+                bv_proj_m = rearrange(proj_mask, 'b v h w -> (b v) () h w')
+
+                # Build 4-channel LiDAR feature
+                lidar_feat_4ch = self.lidar_feature_builder(
+                    bv_depth, bv_proj_d, bv_proj_i, bv_proj_m
+                )  # [B*V, 4, H, W]
+
+                # Depth residual correction (zero-initialized, bounded)
+                depth_residual = self.depth_residual_head(bv_depth, lidar_feat_4ch)  # [B*V, 1, H, W]
+                corrected_depth = bv_depth + depth_residual
+                depth_maps = rearrange(corrected_depth, '(b v) d h w -> b v h w d', b=batch_size, v=V)
+
+                # Lidar feature residual correction (zero-initialized)
+                bv_lidar_feat = rearrange(lidar_feat_maps, 'b v h w d -> (b v) h w d')
+                lidar_feat_4ch_for_feat = lidar_feat_4ch  # reuse
+                lidar_feat_residual = self.lidar_feat_residual_head(bv_depth, lidar_feat_4ch_for_feat)
+                corrected_lidar_feat = bv_lidar_feat + lidar_feat_residual
+                lidar_feat_maps = rearrange(corrected_lidar_feat, '(b v) h w d -> b v h w d', b=batch_size, v=V)
+
+                # Store for sparse depth loss (on depth_maps BEFORE correction)
+                self._lidar_proj_data = {
+                    'depth_maps_before': bv_depth.detach(),  # [B*V, 1, H, W] before correction
+                    'proj_depth': bv_proj_d,  # [B*V, 1, H, W]
+                    'proj_mask': bv_proj_m,   # [B*V, 1, H, W]
+                }
+            except Exception as e:
+                print(f"[WARN] LiDAR conditioning failed: {e}")
+                self._lidar_proj_data = None
+        # ===== 结束: LiDAR 残差修正 =====
 
         bfc_depth_maps = rearrange(depth_maps.squeeze(-1), 'b c h w -> (b c) h w ')
         bfc_K = rearrange(inputs['K'], 'b c i j -> (b c) i j ')
