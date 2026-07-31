@@ -948,6 +948,8 @@ class ReconDrive_LITModelModule(pl.LightningModule):
                 ) * self.lambda_depth_direct
         self.log(f'{stage}/depth_direct', loss_depth_direct.item(),
                  on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
+        # 及时释放图引用: 让 bv_depth 挂着的 VGGT autograd 图在渲染步骤前释放
+        self._lidar_proj_data = None
         # ===== 结束 =====
 
         loss_norm = self.compute_norm_loss(batch_recontrast_data)
@@ -1057,6 +1059,8 @@ class ReconDrive_LITModelModule(pl.LightningModule):
                     ) * self.lambda_depth_direct
         self.log(f'{stage}/depth_direct', loss_depth_direct.item(),
                  on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
+        # 及时释放图引用: 让 bv_depth 挂着的 VGGT autograd 图在渲染步骤前释放
+        self._lidar_proj_data = None
         # ===== 结束 =====
 
         batch_render_data = self.get_render_data(batch_input)
