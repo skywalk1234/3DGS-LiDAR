@@ -1614,7 +1614,7 @@ class ReconDrive_LITModelModule(pl.LightningModule):
 
                 # Store for sparse depth loss (on depth_maps BEFORE correction)
                 self._lidar_proj_data = {
-                    'depth_maps_before': bv_depth.detach(),  # [B*V, 1, H, W] before correction
+                    'depth_maps_before': bv_depth,  # [B*V, 1, H, W] before correction (keep grad for depth_head)
                     'proj_depth': bv_proj_d,  # [B*V, 1, H, W]
                     'proj_mask': bv_proj_m,   # [B*V, 1, H, W]
                 }
