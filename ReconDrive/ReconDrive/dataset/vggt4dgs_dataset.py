@@ -637,6 +637,58 @@ class NuScenesdataset4D(Dataset):
     def __len__(self):
         return len(self.sample_tokens)
 
+    def _project_lidar_to_cameras(self, lidar_points, lidar_to_ego, sample_nusc):
+        """
+        Project LiDAR points to all camera views at a given sample's timestamp.
+        Args:
+            lidar_points: [N, 5] np array (x, y, z, intensity, ring) in LiDAR sensor frame
+            lidar_to_ego: [4, 4] LiDAR-to-ego transformation matrix
+            sample_nusc: nuScenes sample dict, must contain 'data' keys for self.cameras
+        Returns:
+            projected_depth: [num_cameras, H, W] sparse depth maps
+            projected_intensity: [num_cameras, H, W] sparse intensity
+            projected_mask: [num_cameras, H, W] binary valid mask
+        """
+        H, W = 280, 518
+        num_cams = len(self.cameras)
+        lidar_pts = lidar_points[:, :3]  # [N, 3]
+        lidar_intensity = lidar_points[:, 3]  # [N]
+
+        lidar_pts_homo = np.column_stack([lidar_pts, np.ones(len(lidar_pts))])  # [N, 4]
+        lidar_pts_ego = (lidar_to_ego @ lidar_pts_homo.T).T  # [N, 4]
+
+        proj_depth = np.zeros((num_cams, H, W), dtype=np.float32)
+        proj_intensity = np.zeros((num_cams, H, W), dtype=np.float32)
+        proj_mask = np.zeros((num_cams, H, W), dtype=np.float32)
+
+        for cam_idx, cam_name in enumerate(self.cameras):
+            cam_sd = self.dataset.get('sample_data', sample_nusc['data'][cam_name])
+            calib_sensor = self.dataset.get('calibrated_sensor', cam_sd['calibrated_sensor_token'])
+
+            sensor_to_ego = np.eye(4)
+            sensor_to_ego[:3, :3] = Quaternion(calib_sensor['rotation']).rotation_matrix
+            sensor_to_ego[:3, 3] = np.array(calib_sensor['translation'])
+            ego_to_sensor = np.linalg.inv(sensor_to_ego)
+
+            pts_sensor = (ego_to_sensor @ lidar_pts_ego.T).T  # [N, 4]
+            valid_z = pts_sensor[:, 2] > 0
+
+            K = np.eye(4)
+            K[:3, :3] = calib_sensor['camera_intrinsic']
+            pixels = (K @ pts_sensor[valid_z].T).T
+            pixels[:, :2] /= pixels[:, 2:3]
+
+            u = pixels[:, 0].round().astype(int)
+            v = pixels[:, 1].round().astype(int)
+            in_frame = (u >= 0) & (u < W) & (v >= 0) & (v < H)
+
+            idx = np.where(in_frame)[0]
+            proj_depth[cam_idx, v[idx], u[idx]] = pts_sensor[valid_z][idx, 2]
+            proj_intensity[cam_idx, v[idx], u[idx]] = lidar_intensity[valid_z][idx]
+            proj_mask[cam_idx, v[idx], u[idx]] = 1.0
+
+        return proj_depth, proj_intensity, proj_mask
+
     def get_frame(self, idx, frame_idx, scene_token="", scene_name="", scene_idx="", is_key_frame=True, velocity_target_frame_idx=None, velocity_source_frame_idx=None):
         sample_nusc = self.dataset.get('sample', frame_idx)
         sample = []
@@ -984,6 +1036,44 @@ class NuScenesdataset4D(Dataset):
                         'gt_intensity': torch.from_numpy(gt_intensity).float(),
                         'gt_ray_drop': torch.from_numpy(gt_ray_drop).float(),
                     }
+
+                    # ---- Frame 0 LiDAR → 6 cameras projection ----
+                    try:
+                        proj_depth_f0, proj_intensity_f0, proj_mask_f0 = self._project_lidar_to_cameras(
+                            lidar_points, lidar_to_ego, source_sample_data
+                        )
+                        lidar_data['projected_depth_f0'] = torch.from_numpy(proj_depth_f0).float()
+                        lidar_data['projected_intensity_f0'] = torch.from_numpy(proj_intensity_f0).float()
+                        lidar_data['projected_mask_f0'] = torch.from_numpy(proj_mask_f0).float()
+                    except Exception as e:
+                        print(f"Warning: Could not project frame 0 LiDAR: {e}")
+
+                    # ---- Context frame (frame context_span) LiDAR → 6 cameras projection ----
+                    try:
+                        if source_frame_idx:
+                            ctx_sample_data = self.dataset.get('sample', source_frame_idx)
+                            if 'LIDAR_TOP' in ctx_sample_data.get('data', {}):
+                                ctx_lidar_sd = self.dataset.get('sample_data', ctx_sample_data['data']['LIDAR_TOP'])
+                                ctx_lidar_file = os.path.join(self.path, ctx_lidar_sd['filename'])
+                                ctx_lidar_pts = np.fromfile(ctx_lidar_file, dtype=np.float32).reshape(-1, 5)
+
+                                ctx_lidar_pose = self.dataset.get('ego_pose', ctx_lidar_sd['ego_pose_token'])
+                                ctx_calib = self.dataset.get('calibrated_sensor', ctx_lidar_sd['calibrated_sensor_token'])
+
+                                ctx_calib_rot = Quaternion(ctx_calib['rotation']).rotation_matrix
+                                ctx_calib_trans = np.array(ctx_calib['translation']).reshape(1, 3)
+                                ctx_lidar_to_ego = np.eye(4)
+                                ctx_lidar_to_ego[:3, :3] = ctx_calib_rot
+                                ctx_lidar_to_ego[:3, 3] = ctx_calib_trans
+
+                                proj_depth_fn, proj_intensity_fn, proj_mask_fn = self._project_lidar_to_cameras(
+                                    ctx_lidar_pts, ctx_lidar_to_ego, ctx_sample_data
+                                )
+                                lidar_data['projected_depth_fn'] = torch.from_numpy(proj_depth_fn).float()
+                                lidar_data['projected_intensity_fn'] = torch.from_numpy(proj_intensity_fn).float()
+                                lidar_data['projected_mask_fn'] = torch.from_numpy(proj_mask_fn).float()
+                    except Exception as e:
+                        print(f"Warning: Could not load/project context frame LiDAR: {e}")
             except Exception as e:
                 print(f"Warning: Could not load lidar data: {e}")
 

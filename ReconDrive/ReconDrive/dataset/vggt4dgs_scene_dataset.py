@@ -66,6 +66,7 @@ class NuScenesdataset4D(Dataset):
         self.data_transform = data_transform
 
         self.with_depth = depth_type is not None
+        self.sample_rate = 1  # Default subsampling rate (1 = use every frame)
         self.with_pose = with_pose
         self.with_ego_pose = with_ego_pose
 
