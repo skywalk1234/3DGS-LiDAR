@@ -872,6 +872,28 @@ class ReconDrive_LITModelModule(pl.LightningModule):
             return None
 
         B = recontrast_data['xyz'].shape[0]
+
+        # 运动补偿：把参与雷达渲染的高斯统一到 "t0 时刻的 ego_0 坐标系"
+        # GT 雷达是 frame 0 时刻的观测，因此:
+        # 1) 用 xyz_transformed 把 frame N 的高斯从 ego_N 对齐到 ego_0（自车运动）
+        # 2) 用 vehicle flow 把动态物体从 tN 位置补偿回 t0 位置（与渲染 frame 0 相机图一致）
+        if 'xyz_transformed' in recontrast_data:
+            means_all = recontrast_data['xyz_transformed']
+        else:
+            means_all = recontrast_data['xyz']
+        mid_point = means_all.shape[1] // 2
+        means_t = means_all.clone()
+        if self.use_vehicle_flow and 'forward_flow' in recontrast_data:
+            context_span_delta = self.context_span * self.frame_step_s
+            # frame 0 的高斯保持 t0 位置；frame N 的高斯减去 flow * 总时长，补偿回 t0
+            means_t[:, mid_point:] -= recontrast_data['forward_flow'][:, mid_point:] * context_span_delta
+
+        # 旋转属性与位置坐标系保持一致（translate_3dgs 时 rot 也已旋转到 ego_0）
+        if self.translate_3dgs and 'rot_maps_transformed' in recontrast_data:
+            rot_all = recontrast_data['rot_maps_transformed']
+        else:
+            rot_all = recontrast_data['rot_maps']
+
         depth_list, intensity_list, raydrop_list = [], [], []
 
         for bid in range(B):
@@ -890,8 +912,8 @@ class ReconDrive_LITModelModule(pl.LightningModule):
             az_res = az_res.item() if hasattr(az_res, 'item') else float(az_res)
 
             render, alpha, _, _ = lidar_rasterization(
-                means=recontrast_data['xyz'][bid],
-                quats=recontrast_data['rot_maps'][bid],
+                means=means_t[bid],
+                quats=rot_all[bid],
                 scales=recontrast_data['scale_maps'][bid],
                 opacities=recontrast_data['opacity_maps'][bid].squeeze(-1),
                 lidar_features=recontrast_data['lidar_feat_maps'][bid].unsqueeze(0),  # [1, N, D]
