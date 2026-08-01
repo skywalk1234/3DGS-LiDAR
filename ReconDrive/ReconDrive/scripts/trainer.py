@@ -45,6 +45,8 @@ def main():
     parser.add_argument('--pretrained_ckpt', type=str, default='')
     parser.add_argument('--train_4d', action='store_true', help='4dgs')
     parser.add_argument('--devices', type=int, default=None, help='Number of GPUs to use (overrides config)')
+    parser.add_argument('--ckpt_dir', type=str, default=None, help='Custom checkpoint directory (defaults to <save_dir>/ckpt)')
+    parser.add_argument('--save_last_only', action='store_true', help='Only save last.ckpt and best_module.ckpt, skip per-epoch checkpoints (saves disk)')
     args = parser.parse_args()
 
     with open(args.cfg_path) as f:
@@ -64,6 +66,8 @@ def main():
     log_dir = os.path.join(save_dir, 'log')
     ckpt_dir = os.path.join(save_dir, 'ckpt')
     code_dir = os.path.join(save_dir, 'code')
+    if args.ckpt_dir:
+        ckpt_dir = args.ckpt_dir
     os.makedirs(log_dir, exist_ok=True)
     os.makedirs(ckpt_dir, exist_ok=True)
     os.makedirs(code_dir, exist_ok=True)
@@ -123,6 +127,10 @@ def main():
         start_after_epoch=1,
     )
 
+    callbacks = [checkpoint_callback, LearningRateMonitor(), export_metric_callback]
+    if not args.save_last_only:
+        callbacks.insert(1, periodic_checkpoint_callback)
+
     trainer = pl.Trainer(
         max_epochs=main_cfg.get('train_epoch', 50),
         accelerator="gpu",
@@ -131,7 +139,7 @@ def main():
         gradient_clip_algorithm="norm",
         accumulate_grad_batches=8,
         gradient_clip_val=1.0,
-        callbacks=[checkpoint_callback, periodic_checkpoint_callback, LearningRateMonitor(), export_metric_callback],
+        callbacks=callbacks,
         deterministic=True,
         log_every_n_steps=1,
         enable_progress_bar=True,
