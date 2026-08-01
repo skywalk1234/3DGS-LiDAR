@@ -126,7 +126,7 @@ def main():
     trainer = pl.Trainer(
         max_epochs=main_cfg.get('train_epoch', 50),
         accelerator="gpu",
-        devices=1,  # overfit_batches 模式下只用单卡
+        devices=main_cfg['devices'],  # overfit_batches 模式下只用单卡
         precision="32-true",
         gradient_clip_algorithm="norm",
         accumulate_grad_batches=8,
@@ -136,10 +136,9 @@ def main():
         log_every_n_steps=1,
         enable_progress_bar=True,
         enable_model_summary=True,
-        strategy='auto',
+        strategy='ddp_find_unused_parameters_true',
         profiler="simple",
-        logger=logger,
-        overfit_batches=1,  # 只用一个 batch 反复训练，验证代码正确性
+        logger=logger
     )
 
     torch.use_deterministic_algorithms(mode=True,warn_only=True)
