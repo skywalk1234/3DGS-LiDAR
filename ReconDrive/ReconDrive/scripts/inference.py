@@ -804,16 +804,21 @@ def save_lidar_cam_overlays(lidar_gt, lidar_out, batch_render_data, batch_splati
         gt_valid = lidar_gt['gt_depth'][0].reshape(-1) > 0
 
         pred_ray_drop = (torch.sigmoid(lidar_out['ray_drop_logits'][0]).reshape(-1) < 0.5)
-        pred_valid = lidar_out['depth'][0].reshape(-1) > 0
-        pred_valid = gt_valid
+        # Version 1: unfiltered - only use pred depth > 0
+        pred_valid_raw = lidar_out['depth'][0].reshape(-1) > 0
+        # Version 2: filtered by GT mask (gt_depth > 0)
+        pred_valid_gtmask = gt_valid
 
         gt_pts_valid = gt_pts_flat[gt_valid]
-        pred_pts_valid = pred_pts_flat[pred_valid]
+        pred_pts_valid_raw = pred_pts_flat[pred_valid_raw]
+        pred_pts_valid_gtmask = pred_pts_flat[pred_valid_gtmask]
 
         # Project GT points
         gt_uv, gt_z = _project_to_camera(gt_pts_valid, e2c_extr, K, H_img, W_img)
-        # Project Pred points
-        pred_uv, pred_z = _project_to_camera(pred_pts_valid, e2c_extr, K, H_img, W_img)
+        # Project Pred points (unfiltered)
+        pred_uv, pred_z = _project_to_camera(pred_pts_valid_raw, e2c_extr, K, H_img, W_img)
+        # Project Pred points (GT-mask filtered)
+        pred_uv_gtmask, pred_z_gtmask = _project_to_camera(pred_pts_valid_gtmask, e2c_extr, K, H_img, W_img)
 
         def _make_overlay(base_img, uv, z, path):
             """Overlay depth-colored points on base image and save."""
@@ -855,11 +860,16 @@ def save_lidar_cam_overlays(lidar_gt, lidar_out, batch_render_data, batch_splati
         gt_out = os.path.join(lidar_cam_dir, f'cam_{cam_id}_gt_lidar_overlay.png')
         _make_overlay(gt_np, gt_uv, gt_z, gt_out)
 
-        # Save Pred overlay
+        # Save Pred overlay (unfiltered)
         pred_out = os.path.join(lidar_cam_dir, f'cam_{cam_id}_pred_lidar_overlay.png')
         _make_overlay(gt_np, pred_uv, pred_z, pred_out)
 
-        print(f"  GPU {0}: lidar_cam cam_{cam_id}: GT={len(gt_uv)}pts, Pred={len(pred_uv)}pts")
+        # Save Pred overlay (GT-mask filtered)
+        pred_gtmask_out = os.path.join(lidar_cam_dir, f'cam_{cam_id}_pred_lidar_overlay_gtmask.png')
+        _make_overlay(gt_np, pred_uv_gtmask, pred_z_gtmask, pred_gtmask_out)
+
+        print(f"  GPU {0}: lidar_cam cam_{cam_id}: GT={len(gt_uv)}pts, "
+              f"Pred_raw={len(pred_uv)}pts, Pred_gtmask={len(pred_uv_gtmask)}pts")
 
 
 def _run_single_gpu_inference(model, scene_dataloader, device, save_results=True, output_dir=None, novel_distances=[1.0, 2.0], eval_resolution='280x518'):
@@ -1091,3 +1101,105 @@ def main():
     # Load configuration
     print(f"Loading configuration from: {args.cfg_path}")
  
+    with open(args.cfg_path) as f:
+        config = yaml.load(f, Loader=yaml.FullLoader)
+    
+    # Set batch_size to 1 for inference (CRITICAL: must be 1 for proper scene processing)
+    config['model_cfg']['batch_size'] = 1
+    config['data_cfg']['batch_size'] = 1
+    
+    # Pass temporal config from data_cfg to model_cfg for time_delta calculation
+    if 'context_span' in config['data_cfg']:
+        config['model_cfg']['context_span'] = config['data_cfg']['context_span']
+    if 'nuscenes_version' in config['data_cfg']:
+        config['model_cfg']['nuscenes_version'] = config['data_cfg']['nuscenes_version']
+
+
+    # Parse device
+    if args.device:
+        # Single GPU specified: "cuda:0" or "0"
+        if args.device.startswith('cuda:'):
+            device = args.device
+        else:
+            device = f"cuda:{args.device}"
+    elif config.get('devices'):
+        device = f"cuda:{config['devices'][0]}"
+    else:
+        device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
+
+    print(f"Device: {device}")
+    print(f"Batch size: {config['data_cfg']['batch_size']}")
+    
+    # Set output directory
+    if args.output_dir is None:
+        args.output_dir = os.path.join(config['save_dir'], 'scene_inference_results')
+    
+    print(f"Output directory: {args.output_dir}")
+    
+    # Parse save renders flag
+    save_renders = not args.no_renders
+    
+    # Parse novel view distances
+    try:
+        novel_distances = [float(d.strip()) for d in args.novel_distances.split(',')]
+    except ValueError:
+        raise ValueError(f"Invalid novel_distances format: {args.novel_distances}. Use comma-separated floats like '0.5,1.0,2.0,3.0'")
+    
+    print(f"Save renders: {save_renders}")
+    print(f"Novel view distances: {novel_distances}")
+    print(f"Evaluation resolution: {args.eval_resolution}")
+
+    # CRITICAL: Ensure batch_size is 1 before creating data module
+    print(f"Original batch_size in config: {config['data_cfg'].get('batch_size', 'not set')}")
+    config['data_cfg']['batch_size'] = 1  # Must be 1 for proper scene processing
+    print(f"Override batch_size to: {config['data_cfg']['batch_size']}")
+
+    # Initialize scene-based data module
+    print("Initializing scene-based data module...")
+    data_module = VGGT3DGS_SceneDataModule(cfg=config['data_cfg'])
+    data_module.setup(stage='test')
+    
+    # Get scene dataloader
+    scene_dataloader = data_module.test_scene_dataloader()
+    total_scenes = len(scene_dataloader)
+    
+    if args.scene:
+        print(f"Filtering to scene: {args.scene}")
+        scene_list = []
+        for scene_batch in scene_dataloader:
+            if scene_batch['scene_name'] == args.scene:
+                scene_list.append(scene_batch)
+                break
+        if not scene_list:
+            print(f"[ERROR] Scene '{args.scene}' not found in dataset!")
+            sys.exit(1)
+        scene_dataloader = scene_list
+    elif args.max_scenes:
+        print(f"Limiting to {args.max_scenes} scenes (out of {total_scenes})")
+        scene_list = []
+        for i, scene_batch in enumerate(scene_dataloader):
+            if i >= args.max_scenes:
+                break
+            scene_list.append(scene_batch)
+        scene_dataloader = scene_list
+    else:
+        print(f"Processing all {total_scenes} scenes")
+
+
+    # Run single-GPU inference
+    results = run_inference(
+        model_cfg=config['model_cfg'],
+        checkpoint_path=args.restore_ckpt,
+        scene_dataloader=scene_dataloader,
+        device=device,
+        save_results=save_renders,
+        output_dir=args.output_dir,
+        novel_distances=novel_distances,
+        eval_resolution=args.eval_resolution,
+    )
+    
+    print(f"\nScene-based inference completed successfully!")
+    print(f"Results saved to: {args.output_dir}")
+
+if __name__ == "__main__":
+    main()
