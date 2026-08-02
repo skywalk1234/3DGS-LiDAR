@@ -47,6 +47,7 @@ def main():
     parser.add_argument('--devices', type=int, default=None, help='Number of GPUs to use (overrides config)')
     parser.add_argument('--ckpt_dir', type=str, default=None, help='Custom checkpoint directory (defaults to <save_dir>/ckpt)')
     parser.add_argument('--save_last_only', action='store_true', help='Only save last.ckpt and best_module.ckpt, skip per-epoch checkpoints (saves disk)')
+    parser.add_argument('--overfit', action='store_true', help='Overfit on a single batch (overfit_batches=1, single GPU) to quickly verify training')
     args = parser.parse_args()
 
     with open(args.cfg_path) as f:
@@ -60,6 +61,10 @@ def main():
         print(f"Using {args.devices} GPU(s) from command line (overriding config)")
     else:
         print(f"Using {main_cfg['devices']} GPU(s) from config file")
+
+    if args.overfit:
+        main_cfg['devices'] = 1
+        print("Overfit mode: overfit_batches=1, forced single GPU")
 
     save_dir = main_cfg['save_dir']
 
@@ -142,6 +147,7 @@ def main():
         # parameter updates per epoch, which was too slow to learn.)
         accumulate_grad_batches=2,
         gradient_clip_val=1.0,
+        overfit_batches=1 if args.overfit else 0,
         callbacks=callbacks,
         deterministic=True,
         log_every_n_steps=1,
