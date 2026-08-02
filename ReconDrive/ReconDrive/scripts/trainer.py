@@ -137,7 +137,10 @@ def main():
         devices=main_cfg['devices'],  # overfit_batches 模式下只用单卡
         precision="32-true",
         gradient_clip_algorithm="norm",
-        accumulate_grad_batches=8,
+        # batch_size=1 (forced by OOM), accumulate 2 -> effective batch 2.
+        # (Was 8: with only ~30 train samples/epoch that meant only ~4 real
+        # parameter updates per epoch, which was too slow to learn.)
+        accumulate_grad_batches=2,
         gradient_clip_val=1.0,
         callbacks=callbacks,
         deterministic=True,

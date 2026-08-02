@@ -23,6 +23,7 @@ model_cfg:
   lr_restart_mult: 2
   lr_min_factor: 0.1
   backbone_lr_scale: 0.3  # Backbone LR = learning_rate * backbone_lr_scale (only applies when unfreeze_last_n_blocks > 0)
+  residual_lr: 0.0003  # Residual heads LR (depth_residual_head / lidar_feat_residual_head), higher than base LR
 
   frame_ids: [0, 1]
 

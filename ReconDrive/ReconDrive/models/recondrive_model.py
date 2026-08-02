@@ -1263,11 +1263,13 @@ class ReconDrive_LITModelModule(pl.LightningModule):
         return True
                         
     def configure_optimizers(self):
-        # Separate trainable parameters into backbone (aggregator) and head groups
+        # Separate trainable parameters into backbone (aggregator), head, and residual-head groups
         backbone_params = []
         head_params = []
+        residual_params = []
         backbone_names = []
         head_names = []
+        residual_names = []
 
         for name, param in self.model.named_parameters():
             if param.requires_grad:
@@ -1277,6 +1279,16 @@ class ReconDrive_LITModelModule(pl.LightningModule):
                 else:
                     head_params.append(param)
                     head_names.append(name)
+
+        # The residual heads are registered on the LightningModule (self), NOT on
+        # self.model, so they are not captured by the loop above. Collect them
+        # explicitly so they actually get optimized.
+        for name, param in self.named_parameters():
+            if not param.requires_grad:
+                continue
+            if 'depth_residual_head' in name or 'lidar_feat_residual_head' in name:
+                residual_params.append(param)
+                residual_names.append(name)
 
         if self.auto_scale_lr:
             num_devices = self.trainer.num_devices
@@ -1288,16 +1300,23 @@ class ReconDrive_LITModelModule(pl.LightningModule):
         backbone_lr_scale = getattr(self, 'backbone_lr_scale', 0.3)
         backbone_lr = base_lr * backbone_lr_scale
 
+        # Residual heads use a higher LR since they start zero-initialized
+        residual_lr = getattr(self, 'residual_lr', base_lr * 10)
+
         print(f"\nOptimizer configuration (parameter groups):")
         print(f"  Base learning rate: {base_lr}")
         print(f"  Backbone LR scale: {backbone_lr_scale} -> backbone LR: {backbone_lr:.8f}")
+        print(f"  Residual head LR: {residual_lr:.8f}")
         print(f"  Head parameters: {len(head_params)}")
         print(f"  Backbone parameters: {len(backbone_params)}")
+        print(f"  Residual head parameters: {len(residual_params)}")
 
         for name in head_names:
             print(f'  [HEAD] {name}')
         for name in backbone_names:
             print(f'  [BACKBONE] {name}')
+        for name in residual_names:
+            print(f'  [RESIDUAL] {name}')
 
         # Build parameter groups with per-group LR
         param_groups = []
@@ -1305,6 +1324,8 @@ class ReconDrive_LITModelModule(pl.LightningModule):
             param_groups.append({'params': head_params, 'lr': base_lr, 'name': 'heads'})
         if backbone_params:
             param_groups.append({'params': backbone_params, 'lr': backbone_lr, 'name': 'backbone'})
+        if residual_params:
+            param_groups.append({'params': residual_params, 'lr': residual_lr, 'name': 'residual_heads'})
 
         if not param_groups:
             print("ERROR: No trainable parameters found!")
