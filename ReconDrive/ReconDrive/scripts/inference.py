@@ -89,7 +89,8 @@ def load_model_from_checkpoint(checkpoint_path, model_cfg, device):
 def run_inference(model_cfg=None, model=None, checkpoint_path=None,
                   scene_dataloader=None, device='cuda:0',
                   save_results=True, output_dir=None, novel_distances=[1.0, 2.0],
-                  eval_resolution='280x518'):
+                  eval_resolution='280x518', bev_x_range=50.0, bev_y_range=25.0,
+                  bev_height=1000.0, bev_resolution=0.2):
     """
     Scene-based inference function for single GPU
 
@@ -113,7 +114,8 @@ def run_inference(model_cfg=None, model=None, checkpoint_path=None,
             raise ValueError("model_cfg and checkpoint_path required when model is None")
         model = load_model_from_checkpoint(checkpoint_path, model_cfg, device)
 
-    return _run_single_gpu_inference(model, scene_dataloader, device, save_results, output_dir, novel_distances, eval_resolution)
+    return _run_single_gpu_inference(model, scene_dataloader, device, save_results, output_dir, novel_distances, eval_resolution,
+                                     bev_x_range, bev_y_range, bev_height, bev_resolution)
 
 
 def save_rendered_image(tensor_img, save_path, upsample_to=None):
@@ -252,7 +254,8 @@ def _extract_scene_idx(scene_batch, default_idx=0):
             return _extract_first_value(scene_batch[key]['scene_idx'], default_idx)
     return default_idx
 
-def _process_scene_batch(model, scene_batch, device, gpu_id=0, save_renders=True, output_dir=None, novel_distances=[1.0, 2.0], eval_resolution='280x518', batch_idx=0):
+def _process_scene_batch(model, scene_batch, device, gpu_id=0, save_renders=True, output_dir=None, novel_distances=[1.0, 2.0], eval_resolution='280x518', batch_idx=0,
+                         bev_x_range=50.0, bev_y_range=25.0, bev_height=1000.0, bev_resolution=0.2):
     """Process a single scene batch and return results"""
     scene_start_time = time.time()
 
@@ -630,6 +633,25 @@ def _process_scene_batch(model, scene_batch, device, gpu_id=0, save_renders=True
                 )
             # -------------------------
 
+            # --- Save BEV (bird's eye view) outputs ---
+            if output_dir:
+                try:
+                    bev_paths = render_bev_views(
+                        model, batch_recontrast_data, device, scene_name, actual_sample_idx,
+                        output_dir, bev_x_range, bev_y_range, bev_height, bev_resolution,
+                    )
+                    print(f"GPU {gpu_id}: Saved BEV views for sample {actual_sample_idx}: {len(bev_paths)} images")
+
+                    if lidar_out is not None and lidar_gt is not None:
+                        lidar_bev_paths = save_lidar_bev(
+                            lidar_gt, lidar_out, scene_name, actual_sample_idx,
+                            output_dir, bev_x_range, bev_y_range, bev_resolution,
+                        )
+                        print(f"GPU {gpu_id}: Saved LiDAR BEV maps for sample {actual_sample_idx}: {len(lidar_bev_paths)} images")
+                except Exception as e:
+                    print(f"GPU {gpu_id}: [WARN] BEV output failed for sample {actual_sample_idx}: {e}")
+            # -------------------------
+
             # Aggregate scene-level metrics (keep modes separate)
             scene_psnr_list.extend(recon_psnr + novel_psnr)
             scene_ssim_list.extend(recon_ssim + novel_ssim)
@@ -862,7 +884,205 @@ def save_lidar_cam_overlays(lidar_gt, lidar_out, batch_render_data, batch_splati
         print(f"  GPU {0}: lidar_cam cam_{cam_id}: GT={len(gt_uv)}pts, Pred={len(pred_uv)}pts")
 
 
-def _run_single_gpu_inference(model, scene_dataloader, device, save_results=True, output_dir=None, novel_distances=[1.0, 2.0], eval_resolution='280x518'):
+def _apply_colormap(vals):
+    """Map normalized values in [0,1] to a blue->green->red colormap.
+    vals: [H, W] float -> RGB uint8 image [H, W, 3]
+    """
+    v = np.clip(np.asarray(vals, dtype=np.float32), 0, 1)
+    r = np.clip(1.5 - np.abs(4.0 * v - 3.0), 0, 1)
+    g = np.clip(1.5 - np.abs(4.0 * v - 2.0), 0, 1)
+    b = np.clip(1.5 - np.abs(4.0 * v - 1.0), 0, 1)
+    return (np.stack([r, g, b], axis=-1) * 255.0).astype(np.uint8)
+
+
+def render_bev_views(model, recontrast_data, device, scene_name, sample_idx, output_dir,
+                     bev_x_range=50.0, bev_y_range=25.0, bev_height=1000.0, bev_res=0.2):
+    """
+    Render Bird's Eye View (BEV) images of the reconstructed 3DGS scene.
+
+    A virtual top-down camera is placed `bev_height` meters above the ego vehicle,
+    looking straight down at the ground. The Gaussians (stored in the ego frame,
+    `xyz_transformed` = all frames unified to frame-0 ego coordinates) are
+    re-rendered from this camera to produce:
+      - pred_RGB_bev.png    : color BEV image
+      - pred_height_bev.png : height above ground, derived from rendered depth
+
+    NOTE on `bev_height`: gsplat only supports perspective projection. A perspective
+    camera looking straight down magnifies tall objects more than the ground, which
+    makes their tops lean radially outward from the image center (fisheye-like BEV
+    distortion). Setting `bev_height` far above the tallest scene object (default
+    1000 m, ~100x object heights) makes this foreshortening negligible, i.e. an
+    orthographic approximation: the ground-plane mapping is scale-invariant in H
+    (fx/fy scale with H), so the image resolution stays `bev_res` m/pixel.
+
+    Args:
+        bev_x_range: longitudinal range in meters around the ego (+/- forward/back)
+        bev_y_range: lateral range in meters around the ego (+/- left/right)
+        bev_height: virtual camera height above the ground plane (m); use a large
+            value (>= 500) for a near-orthographic top-down view
+        bev_res: BEV pixel resolution (m/pixel)
+
+    Returns the list of saved file paths.
+    """
+    # Image size: columns span the lateral (y) range, rows span the longitudinal (x)
+    # range, both at `bev_res` m/pixel (consistent with save_lidar_bev)
+    bev_w = int(2 * bev_y_range / bev_res)
+    bev_h = int(2 * bev_x_range / bev_res)
+    bev_dir = os.path.join(output_dir, scene_name, f'sample_{sample_idx:04d}', 'bev')
+    os.makedirs(bev_dir, exist_ok=True)
+
+    # Use the unified ego-frame Gaussians (same as render_splating_imgs uses)
+    xyz = recontrast_data.get('xyz_transformed', recontrast_data['xyz'])[:1]
+    rot = recontrast_data.get('rot_maps_transformed', recontrast_data['rot_maps'])[:1]
+    sh = recontrast_data.get('sh_maps_transformed', recontrast_data['sh_maps'])[:1]
+    scale = recontrast_data['scale_maps'][:1]
+    opacity = recontrast_data['opacity_maps'][:1]
+
+    # --- BEV virtual camera (ego -> bev-cam extrinsic) ---
+    # Camera at ego (0, 0, bev_height) looking straight down (-z).
+    # Camera axes in ego frame:
+    #   x_cam = -y_ego (image right = ego -y), y_cam = -x_ego (image up = ego +x),
+    #   z_cam = -z_ego (down)
+    viewmat = torch.eye(4, device=device, dtype=torch.float32)
+    viewmat[0, 0], viewmat[0, 1] = 0.0, -1.0
+    viewmat[1, 0], viewmat[1, 1] = -1.0, 0.0
+    viewmat[2, 2] = -1.0
+    viewmat[2, 3] = bev_height  # t = -R @ cam_pos = (0, 0, H)
+    viewmat = viewmat.unsqueeze(0)  # [1, 4, 4]
+
+    # --- Intrinsics: the ground plane (z=0) sits at camera depth z=bev_height ---
+    # u = fx * x_cam / H + cx,  v = fy * y_cam / H + cy, with x_cam = -y_ego, y_cam = -x_ego:
+    # fx spans the lateral (y_ego) range, fy spans the longitudinal (x_ego) range
+    fx = bev_w * bev_height / (2.0 * bev_y_range)
+    fy = bev_h * bev_height / (2.0 * bev_x_range)
+    K = torch.tensor([[fx, 0.0, bev_w / 2.0],
+                      [0.0, fy, bev_h / 2.0],
+                      [0.0, 0.0, 1.0]], device=device, dtype=torch.float32).unsqueeze(0)  # [1, 3, 3]
+
+    render_colors, render_alphas, meta = rasterization(
+        xyz.squeeze(0),      # [N, 3]
+        rot.squeeze(0),      # [N, 4]
+        scale.squeeze(0),    # [N, 3]
+        opacity.squeeze(0).squeeze(-1),  # [N]
+        sh.squeeze(0),       # [N, K, 3]
+        velocities=None,
+        viewmats=viewmat,    # [1, 4, 4]
+        Ks=K,                # [1, 3, 3]
+        width=bev_w,
+        height=bev_h,
+        sh_degree=getattr(model, 'sh_degree', 3),
+        render_mode="RGB+D",
+    )
+
+    saved_paths = []
+    mask = (render_alphas[0].squeeze(-1) > 0.01).cpu().numpy()  # [H, W], pixels with rendered content
+
+    # Color BEV
+    rgb_img = render_colors[..., :3].permute(0, 3, 1, 2)[0]  # [3, H, W]
+    rgb_img = rgb_img.detach().cpu().numpy().transpose(1, 2, 0)  # [H, W, 3]
+    rgb_img = np.clip(rgb_img * 255.0, 0, 255).astype(np.uint8)
+    rgb_img[~mask] = 255  # white background where nothing was rendered
+    rgb_path = os.path.join(bev_dir, 'pred_RGB_bev.png')
+    Image.fromarray(rgb_img).save(rgb_path)
+    saved_paths.append(rgb_path)
+
+    # Height BEV: height above ground = camera height - camera-z depth
+    depth = render_colors[..., 3]  # [1, H, W]
+    height = (bev_height - depth).clamp(min=0.0)
+    max_height = 10.0  # colormap scale for the height map
+    height_norm = (height[0] / max_height).clamp(0, 1).cpu().numpy()  # [H, W]
+    height_img = _apply_colormap(height_norm)
+    height_img[~mask] = 255
+    height_path = os.path.join(bev_dir, 'pred_height_bev.png')
+    Image.fromarray(height_img).save(height_path)
+    saved_paths.append(height_path)
+
+    return saved_paths
+
+
+def save_lidar_bev(lidar_gt, lidar_out, scene_name, sample_idx, output_dir,
+                   bev_x_range=50.0, bev_y_range=25.0, bev_res=0.2, max_depth=80.0):
+    """
+    Project GT and predicted LiDAR points onto a Bird's Eye View (XY) grid and save images.
+
+    Points (azimuth/elevation/depth) in the LiDAR frame are converted to the ego
+    frame and binned into a 2D grid covering
+    [-bev_x_range, +bev_x_range] x [-bev_y_range, +bev_y_range]. For each bin the
+    closest point (smallest range) is kept, colored by depth or intensity:
+      - lidar_bev_gt_depth.png / lidar_bev_pred_depth.png
+      - lidar_bev_gt_intensity.png / lidar_bev_pred_intensity.png
+
+    Returns the list of saved file paths.
+    """
+    bev_h = int(2 * bev_x_range / bev_res)
+    bev_w = int(2 * bev_y_range / bev_res)
+    bev_dir = os.path.join(output_dir, scene_name, f'sample_{sample_idx:04d}', 'bev')
+    os.makedirs(bev_dir, exist_ok=True)
+
+    raster_pts = lidar_gt['raster_pts']  # [B, H, W, 4]
+    az_rad = torch.deg2rad(raster_pts[..., 0:1])  # [B, H, W, 1]
+    el_rad = torch.deg2rad(raster_pts[..., 1:2])
+    cos_el = torch.cos(el_rad)
+
+    # viewmat is ego->lidar, so lidar_to_ego = inv(viewmat)
+    lidar_to_ego = torch.linalg.inv(lidar_gt['viewmat']).reshape(1, 4, 4)
+
+    def _ego_points(depth):
+        """depth: [B, H, W, 1] -> 3D points in ego frame [B, H, W, 3]"""
+        pts_lidar = torch.cat([
+            depth * cos_el * torch.cos(az_rad),
+            depth * cos_el * torch.sin(az_rad),
+            depth * torch.sin(el_rad),
+        ], dim=-1)
+        ones = torch.ones_like(pts_lidar[..., :1])
+        pts_h = torch.cat([pts_lidar, ones], dim=-1)  # [B, H, W, 4]
+        return torch.matmul(pts_h, lidar_to_ego.transpose(1, 2))[..., :3]
+
+    def _scatter_bev(pts_ego, depth, values, path, vmin, vmax):
+        """Bin points into the BEV grid, keep closest per bin, color by `values`."""
+        pts = pts_ego[0].reshape(-1, 3).detach().cpu().numpy()
+        d = depth[0].reshape(-1).detach().cpu().numpy()
+        v = values[0].reshape(-1).detach().cpu().numpy()
+        valid = d > 0
+        pts, d, v = pts[valid], d[valid], v[valid]
+        img = np.zeros((bev_h, bev_w), dtype=np.float32)
+        if len(pts) > 0:
+            x, y = pts[:, 0], pts[:, 1]
+            in_range = (np.abs(x) <= bev_x_range) & (np.abs(y) <= bev_y_range)
+            x, y, d, v = x[in_range], y[in_range], d[in_range], v[in_range]
+            # row 0 = far front (+x), col 0 = -y side
+            rows = np.floor((bev_x_range - x) / bev_res).astype(np.int64)
+            cols = np.floor((y + bev_y_range) / bev_res).astype(np.int64)
+            rows = np.clip(rows, 0, bev_h - 1)
+            cols = np.clip(cols, 0, bev_w - 1)
+            flat = rows * bev_w + cols
+            # Keep the closest (smallest range) point per bin
+            order = np.argsort(d, kind='stable')
+            s_flat, s_v = flat[order], v[order]
+            _, first = np.unique(s_flat, return_index=True)
+            img.reshape(-1)[s_flat[first]] = s_v[first]
+        colored = _apply_colormap(np.clip((img - vmin) / (vmax - vmin), 0, 1))
+        Image.fromarray(colored).save(path)
+
+    gt_pts = _ego_points(lidar_gt['gt_depth'])
+    pred_pts = _ego_points(lidar_out['depth'])
+
+    saved_paths = []
+    tasks = [
+        ('lidar_bev_gt_depth.png', gt_pts, lidar_gt['gt_depth'], lidar_gt['gt_intensity'], 0.0, max_depth),
+        ('lidar_bev_pred_depth.png', pred_pts, lidar_out['depth'], lidar_out['intensity'], 0.0, max_depth),
+        ('lidar_bev_gt_intensity.png', gt_pts, lidar_gt['gt_depth'], lidar_gt['gt_intensity'], 0.0, 1.0),
+        ('lidar_bev_pred_intensity.png', pred_pts, lidar_out['depth'], lidar_out['intensity'], 0.0, 1.0),
+    ]
+    for fname, pts, depth, values, vmin, vmax in tasks:
+        path = os.path.join(bev_dir, fname)
+        _scatter_bev(pts, depth, values, path, vmin, vmax)
+        saved_paths.append(path)
+    return saved_paths
+
+
+def _run_single_gpu_inference(model, scene_dataloader, device, save_results=True, output_dir=None, novel_distances=[1.0, 2.0], eval_resolution='280x518',
+                              bev_x_range=50.0, bev_y_range=25.0, bev_height=1000.0, bev_resolution=0.2):
     """Run inference on all scenes - simplified using unified scene processing"""
     print(f"\nStarting scene-based inference on device: {device}")
     print(f"Number of scenes: {len(scene_dataloader)}")
@@ -880,7 +1100,9 @@ def _run_single_gpu_inference(model, scene_dataloader, device, save_results=True
             result = _process_scene_batch(model, scene_batch, device, gpu_id=0,
                                         save_renders=save_results, output_dir=output_dir,
                                         novel_distances=novel_distances, eval_resolution=eval_resolution,
-                                        batch_idx=scene_idx)
+                                        batch_idx=scene_idx, bev_x_range=bev_x_range,
+                                        bev_y_range=bev_y_range, bev_height=bev_height,
+                                        bev_resolution=bev_resolution)
 
             all_scene_results.append(result)
             overall_psnr.extend(result['sample_metrics']['psnr_list'])
@@ -1085,6 +1307,16 @@ def main():
                        help='Novel view translation distances in meters (comma-separated, e.g., "0.5,1.0,2.0,3.0")')
     parser.add_argument('--eval_resolution', type=str, default='original',# choices=['original', 'upsampled'],
                        help='Evaluation resolution mode: "original" for 280x518, "upsampled" for 900x1600')
+    parser.add_argument('--bev_x_range', type=float, default=50.0,
+                       help='BEV longitudinal range (+/- meters around ego, forward/back)')
+    parser.add_argument('--bev_y_range', type=float, default=25.0,
+                       help='BEV lateral range (+/- meters around ego, left/right)')
+    parser.add_argument('--bev_height', type=float, default=1000.0,
+                       help='BEV virtual camera height above the ground (meters). Large values '
+                            'approximate orthographic projection, avoiding the radial/lean distortion '
+                            'of tall objects seen with low perspective cameras (use >= 500)')
+    parser.add_argument('--bev_resolution', type=float, default=0.2,
+                       help='BEV pixel resolution (meters per pixel)')
 
     args = parser.parse_args()
     
@@ -1137,6 +1369,7 @@ def main():
     print(f"Save renders: {save_renders}")
     print(f"Novel view distances: {novel_distances}")
     print(f"Evaluation resolution: {args.eval_resolution}")
+    print(f"BEV range: x +/-{args.bev_x_range}m, y +/-{args.bev_y_range}m, height {args.bev_height}m, res {args.bev_resolution}m/px")
 
     # CRITICAL: Ensure batch_size is 1 before creating data module
     print(f"Original batch_size in config: {config['data_cfg'].get('batch_size', 'not set')}")
@@ -1185,6 +1418,10 @@ def main():
         output_dir=args.output_dir,
         novel_distances=novel_distances,
         eval_resolution=args.eval_resolution,
+        bev_x_range=args.bev_x_range,
+        bev_y_range=args.bev_y_range,
+        bev_height=args.bev_height,
+        bev_resolution=args.bev_resolution,
     )
     
     print(f"\nScene-based inference completed successfully!")
