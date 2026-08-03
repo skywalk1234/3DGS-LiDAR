@@ -23,6 +23,14 @@ from torch.utils.data import DataLoader, Dataset
 from PIL import Image
 import torch.nn.functional as F
 from gsplat.rendering import rasterization
+from gsplat.cuda._wrapper import (
+    quat_scale_to_covar_preci,
+    world_to_cam,
+    isect_tiles,
+    isect_offset_encode,
+    rasterize_to_pixels,
+    spherical_harmonics,
+)
 import pandas as pd
 
 project_root = Path(__file__).parent.parent
@@ -90,7 +98,7 @@ def run_inference(model_cfg=None, model=None, checkpoint_path=None,
                   scene_dataloader=None, device='cuda:0',
                   save_results=True, output_dir=None, novel_distances=[1.0, 2.0],
                   eval_resolution='280x518', bev_x_range=50.0, bev_y_range=25.0,
-                  bev_height=1000.0, bev_resolution=0.2):
+                  bev_resolution=0.2):
     """
     Scene-based inference function for single GPU
 
@@ -115,7 +123,7 @@ def run_inference(model_cfg=None, model=None, checkpoint_path=None,
         model = load_model_from_checkpoint(checkpoint_path, model_cfg, device)
 
     return _run_single_gpu_inference(model, scene_dataloader, device, save_results, output_dir, novel_distances, eval_resolution,
-                                     bev_x_range, bev_y_range, bev_height, bev_resolution)
+                                     bev_x_range, bev_y_range, bev_resolution)
 
 
 def save_rendered_image(tensor_img, save_path, upsample_to=None):
@@ -255,7 +263,7 @@ def _extract_scene_idx(scene_batch, default_idx=0):
     return default_idx
 
 def _process_scene_batch(model, scene_batch, device, gpu_id=0, save_renders=True, output_dir=None, novel_distances=[1.0, 2.0], eval_resolution='280x518', batch_idx=0,
-                         bev_x_range=50.0, bev_y_range=25.0, bev_height=1000.0, bev_resolution=0.2):
+                         bev_x_range=50.0, bev_y_range=25.0, bev_resolution=0.2):
     """Process a single scene batch and return results"""
     scene_start_time = time.time()
 
@@ -638,7 +646,7 @@ def _process_scene_batch(model, scene_batch, device, gpu_id=0, save_renders=True
                 try:
                     bev_paths = render_bev_views(
                         model, batch_recontrast_data, device, scene_name, actual_sample_idx,
-                        output_dir, bev_x_range, bev_y_range, bev_height, bev_resolution,
+                        output_dir, bev_x_range, bev_y_range, bev_resolution,
                     )
                     print(f"GPU {gpu_id}: Saved BEV views for sample {actual_sample_idx}: {len(bev_paths)} images")
 
@@ -896,30 +904,36 @@ def _apply_colormap(vals):
 
 
 def render_bev_views(model, recontrast_data, device, scene_name, sample_idx, output_dir,
-                     bev_x_range=50.0, bev_y_range=25.0, bev_height=1000.0, bev_res=0.2):
+                     bev_x_range=50.0, bev_y_range=25.0, bev_res=0.2):
     """
-    Render Bird's Eye View (BEV) images of the reconstructed 3DGS scene.
+    Render Bird's Eye View (BEV) images of the reconstructed 3DGS scene using a
+    TRUE ORTHOGRAPHIC projection.
 
-    A virtual top-down camera is placed `bev_height` meters above the ego vehicle,
-    looking straight down at the ground. The Gaussians (stored in the ego frame,
-    `xyz_transformed` = all frames unified to frame-0 ego coordinates) are
+    A virtual camera looks straight down at the scene (parallel projection, no
+    perspective foreshortening), so a tall object keeps the same footprint and
+    proportions as its ground truth — no radial stretching, no center hole, and
+    no moiré from a degenerate 90-degree perspective covariance (an affine
+    projection maps a 3D Gaussian to an exact 2D Gaussian). The Gaussians are
     re-rendered from this camera to produce:
       - pred_RGB_bev.png    : color BEV image
       - pred_height_bev.png : height above ground, derived from rendered depth
 
-    NOTE on `bev_height`: gsplat only supports perspective projection. A perspective
-    camera looking straight down magnifies tall objects more than the ground, which
-    makes their tops lean radially outward from the image center (fisheye-like BEV
-    distortion). Setting `bev_height` far above the tallest scene object (default
-    1000 m, ~100x object heights) makes this foreshortening negligible, i.e. an
-    orthographic approximation: the ground-plane mapping is scale-invariant in H
-    (fx/fy scale with H), so the image resolution stays `bev_res` m/pixel.
+    Implementation notes (orthographic = skip gsplat's perspective API):
+      1. 3D covariances are built from (quat, scale) with `quat_scale_to_covar_preci`
+         and transformed to the camera frame with `world_to_cam`.
+      2. Projection is affine:  u = fx * x_cam + cx,  v = fy * y_cam + cy,
+         with fx = W / (2*bev_y_range) px/m, fy = H / (2*bev_x_range) px/m, and
+         2D covariance  covars2d = J * covars_cam * J^T,  J = diag(fx, fy).
+         (For perspective the same would require dividing by z, which blows up
+         when looking straight down.)
+      3. The remaining pipeline (conics / radius / isect_tiles /
+         isect_offset_encode / rasterize_to_pixels) is identical to what the
+         high-level `rasterization()` uses internally, so rendering is exactly
+         as faithful as the normal perspective path.
 
     Args:
         bev_x_range: longitudinal range in meters around the ego (+/- forward/back)
         bev_y_range: lateral range in meters around the ego (+/- left/right)
-        bev_height: virtual camera height above the ground plane (m); use a large
-            value (>= 500) for a near-orthographic top-down view
         bev_res: BEV pixel resolution (m/pixel)
 
     Returns the list of saved file paths.
@@ -932,47 +946,119 @@ def render_bev_views(model, recontrast_data, device, scene_name, sample_idx, out
     os.makedirs(bev_dir, exist_ok=True)
 
     # Use the unified ego-frame Gaussians (same as render_splating_imgs uses)
-    xyz = recontrast_data.get('xyz_transformed', recontrast_data['xyz'])[:1]
-    rot = recontrast_data.get('rot_maps_transformed', recontrast_data['rot_maps'])[:1]
-    sh = recontrast_data.get('sh_maps_transformed', recontrast_data['sh_maps'])[:1]
-    scale = recontrast_data['scale_maps'][:1]
-    opacity = recontrast_data['opacity_maps'][:1]
+    xyz = recontrast_data.get('xyz_transformed', recontrast_data['xyz'])[:1].squeeze(0)      # [N, 3]
+    rot = recontrast_data.get('rot_maps_transformed', recontrast_data['rot_maps'])[:1].squeeze(0)  # [N, 4]
+    sh = recontrast_data.get('sh_maps_transformed', recontrast_data['sh_maps'])[:1].squeeze(0)      # [N, K, 3]
+    scale = recontrast_data['scale_maps'][:1].squeeze(0)                                        # [N, 3]
+    opacity = recontrast_data['opacity_maps'][:1].squeeze(0).squeeze(-1)                        # [N]
+    N = xyz.shape[0]
 
     # --- BEV virtual camera (ego -> bev-cam extrinsic) ---
-    # Camera at ego (0, 0, bev_height) looking straight down (-z).
     # Camera axes in ego frame:
     #   x_cam = -y_ego (image right = ego -y), y_cam = -x_ego (image up = ego +x),
-    #   z_cam = -z_ego (down)
+    #   z_cam = -z_ego (looking down). det(R) = +1 (right-handed, no mirroring).
+    # `cam_depth_ref` only sets the offset of the camera-space depth
+    # (depth = cam_depth_ref - z_ego); orthographic projection is invariant to
+    # it, so any value above the tallest object works.
+    cam_depth_ref = 100.0
     viewmat = torch.eye(4, device=device, dtype=torch.float32)
     viewmat[0, 0], viewmat[0, 1] = 0.0, -1.0
     viewmat[1, 0], viewmat[1, 1] = -1.0, 0.0
     viewmat[2, 2] = -1.0
-    viewmat[2, 3] = bev_height  # t = -R @ cam_pos = (0, 0, H)
+    viewmat[2, 3] = cam_depth_ref  # t = -R @ cam_pos = (0, 0, cam_depth_ref)
     viewmat = viewmat.unsqueeze(0)  # [1, 4, 4]
 
-    # --- Intrinsics: the ground plane (z=0) sits at camera depth z=bev_height ---
-    # u = fx * x_cam / H + cx,  v = fy * y_cam / H + cy, with x_cam = -y_ego, y_cam = -x_ego:
-    # fx spans the lateral (y_ego) range, fy spans the longitudinal (x_ego) range
-    fx = bev_w * bev_height / (2.0 * bev_y_range)
-    fy = bev_h * bev_height / (2.0 * bev_x_range)
-    K = torch.tensor([[fx, 0.0, bev_w / 2.0],
-                      [0.0, fy, bev_h / 2.0],
-                      [0.0, 0.0, 1.0]], device=device, dtype=torch.float32).unsqueeze(0)  # [1, 3, 3]
+    # --- Orthographic scale (pixels per meter) ---
+    fx = bev_w / (2.0 * bev_y_range)  # px/m along x_cam (-y_ego)
+    fy = bev_h / (2.0 * bev_x_range)  # px/m along y_cam (-x_ego)
+    cx = bev_w / 2.0
+    cy = bev_h / 2.0
 
-    render_colors, render_alphas, meta = rasterization(
-        xyz.squeeze(0),      # [N, 3]
-        rot.squeeze(0),      # [N, 4]
-        scale.squeeze(0),    # [N, 3]
-        opacity.squeeze(0).squeeze(-1),  # [N]
-        sh.squeeze(0),       # [N, K, 3]
-        velocities=None,
-        viewmats=viewmat,    # [1, 4, 4]
-        Ks=K,                # [1, 3, 3]
-        width=bev_w,
-        height=bev_h,
-        sh_degree=getattr(model, 'sh_degree', 3),
-        render_mode="RGB+D",
+    # 1. 3D covariances in world (ego) frame, then to camera frame
+    covars, _ = quat_scale_to_covar_preci(rot, scale, compute_preci=False)  # [N, 3, 3]
+    means_c, covars_c = world_to_cam(xyz, covars, viewmat)  # [1, N, 3], [1, N, 3, 3]
+
+    # 2. Orthographic projection (affine => exact 2D Gaussian, no depth division)
+    means2d = torch.stack(
+        [means_c[..., 0] * fx + cx, means_c[..., 1] * fy + cy], dim=-1
+    )  # [1, N, 2]
+    # J = [[fx, 0, 0], [0, fy, 0]];  covars2d = J * covars_c * J^T is just a rescale
+    covars2d = torch.stack(
+        [
+            fx * fx * covars_c[..., 0, 0],
+            fx * fy * covars_c[..., 0, 1],
+            fx * fy * covars_c[..., 1, 0],
+            fy * fy * covars_c[..., 1, 1],
+        ],
+        dim=-1,
+    ).reshape(1, N, 2, 2)  # [1, N, 2, 2]
+
+    # 3. Conics / radius / depths / validity (same convention as fully_fused_projection)
+    eps2d = 0.3
+    covars2d = covars2d + torch.eye(2, device=device, dtype=torch.float32) * eps2d
+    det = covars2d[..., 0, 0] * covars2d[..., 1, 1] - covars2d[..., 0, 1] * covars2d[..., 1, 0]
+    det = det.clamp(min=1e-10)
+    conics = torch.stack(
+        [
+            covars2d[..., 1, 1] / det,
+            -(covars2d[..., 0, 1] + covars2d[..., 1, 0]) / 2.0 / det,
+            covars2d[..., 0, 0] / det,
+        ],
+        dim=-1,
+    )  # [1, N, 3]
+
+    depths = means_c[..., 2]  # [1, N], camera-space z = cam_depth_ref - z_ego
+    radius = 3.0 * torch.sqrt(
+        torch.stack([covars2d[..., 0, 0], covars2d[..., 1, 1]], dim=-1)
+    )  # [1, N, 2]
+    valid = (det > 0) & (depths > 0.01) & (depths < 1e10)
+    radius[~valid] = 0.0
+    inside = (
+        (means2d[..., 0] + radius[..., 0] > 0)
+        & (means2d[..., 0] - radius[..., 0] < bev_w)
+        & (means2d[..., 1] + radius[..., 1] > 0)
+        & (means2d[..., 1] - radius[..., 1] < bev_h)
     )
+    radius[~inside] = 0.0
+    radii = radius.int()  # [1, N, 2]
+
+    # 4. Identify intersecting tiles and rasterize (same kernels as rasterization())
+    tile_size = 16
+    tile_width = (bev_w + tile_size - 1) // tile_size
+    tile_height = (bev_h + tile_size - 1) // tile_size
+    _, isect_ids, flatten_ids = isect_tiles(
+        means2d, radii, depths, tile_size, tile_width, tile_height, packed=False,
+    )
+    isect_offsets = isect_offset_encode(isect_ids, 1, tile_width, tile_height)
+
+    # 5. Colors: activate SH for the BEV view (same as rendering.py non-packed branch)
+    sh_degree = getattr(model, 'sh_degree', 3)
+    camtoworlds = torch.inverse(viewmat)  # [1, 4, 4]
+    dirs = xyz[None, :, :] - camtoworlds[:, None, :3, 3]  # [1, N, 3]
+    masks = radii[..., 0] > 0  # [1, N]
+    shs = sh.unsqueeze(0).expand(1, -1, -1, -1)  # [1, N, K, 3]
+    colors = spherical_harmonics(sh_degree, dirs, shs, masks=masks)  # [1, N, 3]
+    colors = torch.clamp_min(colors + 0.5, 0.0)
+    colors = torch.cat([colors, depths[..., None]], dim=-1)  # [1, N, 4] (RGB+D)
+
+    opacities = opacity[None, :].repeat(1, 1)  # [1, N]
+    pix_vels = torch.zeros(1, N, 2, device=device, dtype=torch.float32)
+
+    render_colors, render_alphas, _ = rasterize_to_pixels(
+        means2d,
+        conics,
+        colors,
+        opacities,
+        pix_vels,
+        bev_w,
+        bev_h,
+        tile_size,
+        isect_offsets,
+        flatten_ids,
+        rolling_shutter_time=None,
+        backgrounds=None,
+        packed=False,
+    )  # render_colors [1, bev_h, bev_w, 4]
 
     saved_paths = []
     mask = (render_alphas[0].squeeze(-1) > 0.01).cpu().numpy()  # [H, W], pixels with rendered content
@@ -986,9 +1072,10 @@ def render_bev_views(model, recontrast_data, device, scene_name, sample_idx, out
     Image.fromarray(rgb_img).save(rgb_path)
     saved_paths.append(rgb_path)
 
-    # Height BEV: height above ground = camera height - camera-z depth
+    # Height BEV: depth is camera-space z = cam_depth_ref - z_ego,
+    # so height above ground = cam_depth_ref - depth = z_ego
     depth = render_colors[..., 3]  # [1, H, W]
-    height = (bev_height - depth).clamp(min=0.0)
+    height = (cam_depth_ref - depth).clamp(min=0.0)
     max_height = 10.0  # colormap scale for the height map
     height_norm = (height[0] / max_height).clamp(0, 1).cpu().numpy()  # [H, W]
     height_img = _apply_colormap(height_norm)
@@ -1008,7 +1095,9 @@ def save_lidar_bev(lidar_gt, lidar_out, scene_name, sample_idx, output_dir,
     Points (azimuth/elevation/depth) in the LiDAR frame are converted to the ego
     frame and binned into a 2D grid covering
     [-bev_x_range, +bev_x_range] x [-bev_y_range, +bev_y_range]. For each bin the
-    closest point (smallest range) is kept, colored by depth or intensity:
+    closest point (smallest range) is kept. Points are drawn on a pure white
+    background and colored with a blue->green->red value colormap (depth maps
+    colored by range in [0, max_depth], intensity maps by intensity in [0, 1]):
       - lidar_bev_gt_depth.png / lidar_bev_pred_depth.png
       - lidar_bev_gt_intensity.png / lidar_bev_pred_intensity.png
 
@@ -1038,8 +1127,15 @@ def save_lidar_bev(lidar_gt, lidar_out, scene_name, sample_idx, output_dir,
         pts_h = torch.cat([pts_lidar, ones], dim=-1)  # [B, H, W, 4]
         return torch.matmul(pts_h, lidar_to_ego.transpose(1, 2))[..., :3]
 
-    def _scatter_bev(pts_ego, depth, values, path, vmin, vmax):
-        """Bin points into the BEV grid, keep closest per bin, color by `values`."""
+    def _scatter_bev(pts_ego, depth, values, path, vmin, vmax, stretch_sqrt=False):
+        """Bin points into the BEV grid, keep closest per bin.
+
+        Pure white background; points are colored with the blue->green->red
+        value colormap (depth maps: colored by range in [0, max_depth];
+        intensity maps: colored by intensity in [0, 1]). When `stretch_sqrt`
+        is True the normalized value is sqrt-stretched, which spreads the
+        usually-crowded near-range depths across more colors.
+        """
         pts = pts_ego[0].reshape(-1, 3).detach().cpu().numpy()
         d = depth[0].reshape(-1).detach().cpu().numpy()
         v = values[0].reshape(-1).detach().cpu().numpy()
@@ -1061,7 +1157,13 @@ def save_lidar_bev(lidar_gt, lidar_out, scene_name, sample_idx, output_dir,
             s_flat, s_v = flat[order], v[order]
             _, first = np.unique(s_flat, return_index=True)
             img.reshape(-1)[s_flat[first]] = s_v[first]
-        colored = _apply_colormap(np.clip((img - vmin) / (vmax - vmin), 0, 1))
+        colored = np.full((bev_h, bev_w, 3), 255, dtype=np.uint8)  # pure white background
+        norm = np.clip((img - vmin) / (vmax - vmin), 0, 1)
+        if stretch_sqrt:
+            norm = np.sqrt(norm)
+        cm = _apply_colormap(norm)
+        pts_mask = img > 0
+        colored[pts_mask] = cm[pts_mask]
         Image.fromarray(colored).save(path)
 
     gt_pts = _ego_points(lidar_gt['gt_depth'])
@@ -1069,20 +1171,20 @@ def save_lidar_bev(lidar_gt, lidar_out, scene_name, sample_idx, output_dir,
 
     saved_paths = []
     tasks = [
-        ('lidar_bev_gt_depth.png', gt_pts, lidar_gt['gt_depth'], lidar_gt['gt_intensity'], 0.0, max_depth),
-        ('lidar_bev_pred_depth.png', pred_pts, lidar_out['depth'], lidar_out['intensity'], 0.0, max_depth),
-        ('lidar_bev_gt_intensity.png', gt_pts, lidar_gt['gt_depth'], lidar_gt['gt_intensity'], 0.0, 1.0),
-        ('lidar_bev_pred_intensity.png', pred_pts, lidar_out['depth'], lidar_out['intensity'], 0.0, 1.0),
+        ('lidar_bev_gt_depth.png', gt_pts, lidar_gt['gt_depth'], lidar_gt['gt_depth'], 0.0, max_depth, True),
+        ('lidar_bev_pred_depth.png', pred_pts, lidar_out['depth'], lidar_out['depth'], 0.0, max_depth, True),
+        ('lidar_bev_gt_intensity.png', gt_pts, lidar_gt['gt_depth'], lidar_gt['gt_intensity'], 0.0, 1.0, False),
+        ('lidar_bev_pred_intensity.png', pred_pts, lidar_out['depth'], lidar_out['intensity'], 0.0, 1.0, False),
     ]
-    for fname, pts, depth, values, vmin, vmax in tasks:
+    for fname, pts, depth, values, vmin, vmax, stretch in tasks:
         path = os.path.join(bev_dir, fname)
-        _scatter_bev(pts, depth, values, path, vmin, vmax)
+        _scatter_bev(pts, depth, values, path, vmin, vmax, stretch_sqrt=stretch)
         saved_paths.append(path)
     return saved_paths
 
 
 def _run_single_gpu_inference(model, scene_dataloader, device, save_results=True, output_dir=None, novel_distances=[1.0, 2.0], eval_resolution='280x518',
-                              bev_x_range=50.0, bev_y_range=25.0, bev_height=1000.0, bev_resolution=0.2):
+                              bev_x_range=50.0, bev_y_range=25.0, bev_resolution=0.2):
     """Run inference on all scenes - simplified using unified scene processing"""
     print(f"\nStarting scene-based inference on device: {device}")
     print(f"Number of scenes: {len(scene_dataloader)}")
@@ -1101,8 +1203,7 @@ def _run_single_gpu_inference(model, scene_dataloader, device, save_results=True
                                         save_renders=save_results, output_dir=output_dir,
                                         novel_distances=novel_distances, eval_resolution=eval_resolution,
                                         batch_idx=scene_idx, bev_x_range=bev_x_range,
-                                        bev_y_range=bev_y_range, bev_height=bev_height,
-                                        bev_resolution=bev_resolution)
+                                        bev_y_range=bev_y_range, bev_resolution=bev_resolution)
 
             all_scene_results.append(result)
             overall_psnr.extend(result['sample_metrics']['psnr_list'])
@@ -1311,10 +1412,6 @@ def main():
                        help='BEV longitudinal range (+/- meters around ego, forward/back)')
     parser.add_argument('--bev_y_range', type=float, default=25.0,
                        help='BEV lateral range (+/- meters around ego, left/right)')
-    parser.add_argument('--bev_height', type=float, default=1000.0,
-                       help='BEV virtual camera height above the ground (meters). Large values '
-                            'approximate orthographic projection, avoiding the radial/lean distortion '
-                            'of tall objects seen with low perspective cameras (use >= 500)')
     parser.add_argument('--bev_resolution', type=float, default=0.2,
                        help='BEV pixel resolution (meters per pixel)')
 
@@ -1369,7 +1466,7 @@ def main():
     print(f"Save renders: {save_renders}")
     print(f"Novel view distances: {novel_distances}")
     print(f"Evaluation resolution: {args.eval_resolution}")
-    print(f"BEV range: x +/-{args.bev_x_range}m, y +/-{args.bev_y_range}m, height {args.bev_height}m, res {args.bev_resolution}m/px")
+    print(f"BEV range: x +/-{args.bev_x_range}m, y +/-{args.bev_y_range}m (orthographic), res {args.bev_resolution}m/px")
 
     # CRITICAL: Ensure batch_size is 1 before creating data module
     print(f"Original batch_size in config: {config['data_cfg'].get('batch_size', 'not set')}")
@@ -1420,7 +1517,6 @@ def main():
         eval_resolution=args.eval_resolution,
         bev_x_range=args.bev_x_range,
         bev_y_range=args.bev_y_range,
-        bev_height=args.bev_height,
         bev_resolution=args.bev_resolution,
     )
     
