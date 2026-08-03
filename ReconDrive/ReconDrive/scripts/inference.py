@@ -851,20 +851,22 @@ def save_lidar_cam_overlays(lidar_gt, lidar_out, batch_render_data, batch_splati
         e2c_extr = batch_render_data[e2c_key][0:1]  # [1, 4, 4]
         K = batch_render_data[K_key][0, :3, :3]     # [3, 3]
 
-        # Flatten LiDAR points to [H*W, 3]
-        gt_pts_flat = gt_pts_3d[0].reshape(-1, 3)   # [H*W, 3]
+        # Flatten Pred LiDAR points to [H*W, 3]
         pred_pts_flat = pred_pts_3d[0].reshape(-1, 3)
 
-        # Valid masks: depth > 0 AND not ray-dropped
-        # NOTE: gt_ray_drop uses 1.0=valid(point exists), 0.0=dropped(no return)
-        # So depth > 0 is already equivalent to ray_drop > 0.5 (redundant, kept for clarity)
-        gt_valid = lidar_gt['gt_depth'][0].reshape(-1) > 0
+        # GT: use the raw sensor point cloud (full sweep, no range-image binning)
+        # when available; fall back to the rasterized range-image points.
+        if 'raw_points' in lidar_gt:
+            gt_pts_valid = lidar_gt['raw_points'][0, :, :3]  # [N, 3] LiDAR frame
+        else:
+            gt_pts_flat = gt_pts_3d[0].reshape(-1, 3)
+            gt_valid = lidar_gt['gt_depth'][0].reshape(-1) > 0
+            gt_pts_valid = gt_pts_flat[gt_valid]
 
         pred_ray_drop = (torch.sigmoid(lidar_out['ray_drop_logits'][0]).reshape(-1) < 0.5)
         pred_valid = lidar_out['depth'][0].reshape(-1) > 0
         pred_valid = pred_valid
 
-        gt_pts_valid = gt_pts_flat[gt_valid]
         pred_pts_valid = pred_pts_flat[pred_valid]
 
         # Project GT points
@@ -1164,13 +1166,14 @@ def save_gaussians_ply(xyz, rot, scale, opacity, sh, path):
 def save_lidar_ply(lidar_gt, lidar_out, scene_name, sample_idx, output_dir):
     """Save GT and predicted LiDAR point clouds as PLY files in the lidar folder.
 
-    Points are recovered from the range image (azimuth/elevation/depth) in the
-    LiDAR frame, transformed into the ego frame (same convention as
-    save_lidar_bev), and written as ASCII PLY with x/y/z/intensity/depth
-    properties to <sample>/lidar/gt_points.ply and <sample>/lidar/pred_points.ply.
-    A third file <sample>/lidar/pred_points_mask.ply holds the predicted points
-    additionally masked by the GT depth>0 validity mask (for fair comparison
-    on the same rays).
+    When the raw sensor point cloud ('raw_points') is available, the GT PLY is
+    written from the full raw sweep (no range-image binning); otherwise it falls
+    back to the points recovered from the range image. Points are transformed
+    into the ego frame (same convention as save_lidar_bev) and written as ASCII
+    PLY with x/y/z/intensity/depth properties to <sample>/lidar/gt_points.ply
+    and <sample>/lidar/pred_points.ply. A third file
+    <sample>/lidar/pred_points_mask.ply holds the predicted points additionally
+    masked by the GT depth>0 validity mask (for fair comparison on the same rays).
 
     Returns the list of saved file paths.
     """
@@ -1220,9 +1223,22 @@ def save_lidar_ply(lidar_gt, lidar_out, scene_name, sample_idx, output_dir):
         return n
 
     saved_paths = []
-    gt_pts = _ego_points(lidar_gt['gt_depth'])
+    if 'raw_points' in lidar_gt:
+        # GT from the raw sensor point cloud (full sweep, no range-image binning)
+        pts_lidar = lidar_gt['raw_points'][0, :, :3]  # [N, 3] LiDAR frame
+        depth_lidar = torch.linalg.norm(pts_lidar, dim=-1, keepdim=True)  # [N, 1]
+        int_lidar = (lidar_gt['raw_points'][0, :, 3:4] / 255.0)  # [N, 1]
+        ones = torch.ones_like(pts_lidar[..., :1])
+        pts_h = torch.cat([pts_lidar, ones], dim=-1)  # [N, 4]
+        gt_pts = torch.matmul(pts_h, lidar_to_ego.transpose(1, 2))[..., :3][None]  # [1, N, 3] ego frame
+        gt_depth_v = depth_lidar[None]  # [1, N, 1]
+        gt_int_v = int_lidar[None]  # [1, N, 1]
+    else:
+        gt_pts = _ego_points(lidar_gt['gt_depth'])
+        gt_depth_v = lidar_gt['gt_depth']
+        gt_int_v = lidar_gt['gt_intensity']
     gt_path = os.path.join(lidar_dir, 'gt_points.ply')
-    _write_ply(gt_path, gt_pts, lidar_gt['gt_depth'], lidar_gt['gt_intensity'])
+    _write_ply(gt_path, gt_pts, gt_depth_v, gt_int_v)
     saved_paths.append(gt_path)
 
     pred_pts = _ego_points(lidar_out['depth'])
