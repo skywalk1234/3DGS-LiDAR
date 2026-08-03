@@ -98,7 +98,7 @@ def run_inference(model_cfg=None, model=None, checkpoint_path=None,
                   scene_dataloader=None, device='cuda:0',
                   save_results=True, output_dir=None, novel_distances=[1.0, 2.0],
                   eval_resolution='280x518', bev_x_range=50.0, bev_y_range=25.0,
-                  bev_resolution=0.2):
+                  bev_resolution=0.2, output_gs=False):
     """
     Scene-based inference function for single GPU
 
@@ -123,7 +123,7 @@ def run_inference(model_cfg=None, model=None, checkpoint_path=None,
         model = load_model_from_checkpoint(checkpoint_path, model_cfg, device)
 
     return _run_single_gpu_inference(model, scene_dataloader, device, save_results, output_dir, novel_distances, eval_resolution,
-                                     bev_x_range, bev_y_range, bev_resolution)
+                                     bev_x_range, bev_y_range, bev_resolution, output_gs)
 
 
 def save_rendered_image(tensor_img, save_path, upsample_to=None):
@@ -263,7 +263,7 @@ def _extract_scene_idx(scene_batch, default_idx=0):
     return default_idx
 
 def _process_scene_batch(model, scene_batch, device, gpu_id=0, save_renders=True, output_dir=None, novel_distances=[1.0, 2.0], eval_resolution='280x518', batch_idx=0,
-                         bev_x_range=50.0, bev_y_range=25.0, bev_resolution=0.2):
+                         bev_x_range=50.0, bev_y_range=25.0, bev_resolution=0.2, output_gs=False):
     """Process a single scene batch and return results"""
     scene_start_time = time.time()
 
@@ -660,6 +660,33 @@ def _process_scene_batch(model, scene_batch, device, gpu_id=0, save_renders=True
                     print(f"GPU {gpu_id}: [WARN] BEV output failed for sample {actual_sample_idx}: {e}")
             # -------------------------
 
+            # --- Save LiDAR point clouds (PLY) ---
+            if lidar_out is not None and lidar_gt is not None and output_dir:
+                try:
+                    ply_paths = save_lidar_ply(
+                        lidar_gt, lidar_out, scene_name, actual_sample_idx, output_dir,
+                    )
+                    ply_names = [os.path.basename(p) for p in ply_paths]
+                    print(f"GPU {gpu_id}: Saved LiDAR point clouds for sample {actual_sample_idx}: {ply_names}")
+                except Exception as e:
+                    print(f"GPU {gpu_id}: [WARN] LiDAR PLY output failed for sample {actual_sample_idx}: {e}")
+            # -------------------------
+
+            # --- Save 3D Gaussian assets (PLY) ---
+            if output_gs and output_dir:
+                try:
+                    gs_path = os.path.join(output_dir, scene_name, f'sample_{actual_sample_idx:04d}', 'gaussians.ply')
+                    gs_xyz = batch_recontrast_data.get('xyz_transformed', batch_recontrast_data['xyz'])[:1]
+                    gs_rot = batch_recontrast_data.get('rot_maps_transformed', batch_recontrast_data['rot_maps'])[:1]
+                    gs_sh = batch_recontrast_data.get('sh_maps_transformed', batch_recontrast_data['sh_maps'])[:1]
+                    gs_scale = batch_recontrast_data['scale_maps'][:1]
+                    gs_opacity = batch_recontrast_data['opacity_maps'][:1]
+                    n_gs = save_gaussians_ply(gs_xyz, gs_rot, gs_scale, gs_opacity, gs_sh, gs_path)
+                    print(f"GPU {gpu_id}: Saved {n_gs} Gaussians for sample {actual_sample_idx} -> gaussians.ply")
+                except Exception as e:
+                    print(f"GPU {gpu_id}: [WARN] Gaussian PLY output failed for sample {actual_sample_idx}: {e}")
+            # -------------------------
+
             # Aggregate scene-level metrics (keep modes separate)
             scene_psnr_list.extend(recon_psnr + novel_psnr)
             scene_ssim_list.extend(recon_ssim + novel_ssim)
@@ -724,7 +751,7 @@ def _process_scene_batch(model, scene_batch, device, gpu_id=0, save_renders=True
 
 def save_lidar_cam_overlays(lidar_gt, lidar_out, batch_render_data, batch_splating_data,
                             scene_name, sample_idx, output_dir, num_cams=6, max_depth=80.0,
-                            point_radius=2, alpha=0.8):
+                            point_radius=1, alpha=0.8):
     """
     Project GT and Pred LiDAR points to each camera view and overlay on GT images.
 
@@ -1098,6 +1125,131 @@ def render_bev_views(model, recontrast_data, device, scene_name, sample_idx, out
     return saved_paths
 
 
+def save_gaussians_ply(xyz, rot, scale, opacity, sh, path):
+    """Save the 3D Gaussian assets of a scene to a standard 3DGS binary PLY file.
+
+    Args:
+        xyz: [B, N, 3] Gaussian centers (world/ego frame).
+        rot: [B, N, 4] quaternions (w, x, y, z).
+        scale: [B, N, 3] Gaussian scales.
+        opacity: [B, N, 1] opacities (0-1).
+        sh: [B, N, K, 3] spherical harmonic coefficients.
+        path: Output .ply path.
+
+    The PLY follows the standard 3DGS layout (binary little-endian float32):
+    x y z nx ny nz f_dc_0..2 f_rest_0..(K*3-4) opacity scale_0..2 rot_0..3.
+
+    Returns the number of Gaussians written.
+    """
+    xyz_np = xyz[0].reshape(-1, 3).detach().cpu().numpy().astype(np.float32)
+    rot_np = rot[0].reshape(-1, 4).detach().cpu().numpy().astype(np.float32)
+    scale_np = scale[0].reshape(-1, 3).detach().cpu().numpy().astype(np.float32)
+    opacity_np = opacity[0].reshape(-1, 1).detach().cpu().numpy().astype(np.float32)
+    K = sh[0].shape[-2]
+    sh_np = sh[0].reshape(-1, K, 3).detach().cpu().numpy().astype(np.float32)
+    N = xyz_np.shape[0]
+    f_dc = sh_np[:, 0, :]  # [N, 3]
+    f_rest = sh_np[:, 1:, :].reshape(N, -1)  # [N, (K-1)*3]
+    rest_num = f_rest.shape[1]
+    normals = np.zeros_like(xyz_np)
+    data = np.concatenate([xyz_np, normals, f_dc, f_rest, opacity_np, scale_np, rot_np], axis=1)
+
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, 'wb') as f:
+        f.write(b"ply\n")
+        f.write(b"format binary_little_endian 1.0\n")
+        f.write(f"element vertex {N}\n".encode())
+        f.write(b"property float x\nproperty float y\nproperty float z\n")
+        f.write(b"property float nx\nproperty float ny\nproperty float nz\n")
+        f.write(b"property float f_dc_0\nproperty float f_dc_1\nproperty float f_dc_2\n")
+        for i in range(rest_num):
+            f.write(f"property float f_rest_{i}\n".encode())
+        f.write(b"property float opacity\n")
+        f.write(b"property float scale_0\nproperty float scale_1\nproperty float scale_2\n")
+        f.write(b"property float rot_0\nproperty float rot_1\nproperty float rot_2\nproperty float rot_3\n")
+        f.write(b"end_header\n")
+        f.write(data.tobytes())
+    return N
+
+
+def save_lidar_ply(lidar_gt, lidar_out, scene_name, sample_idx, output_dir):
+    """Save GT and predicted LiDAR point clouds as PLY files in the lidar folder.
+
+    Points are recovered from the range image (azimuth/elevation/depth) in the
+    LiDAR frame, transformed into the ego frame (same convention as
+    save_lidar_bev), and written as ASCII PLY with x/y/z/intensity/depth
+    properties to <sample>/lidar/gt_points.ply and <sample>/lidar/pred_points.ply.
+    A third file <sample>/lidar/pred_points_mask.ply holds the predicted points
+    additionally masked by the GT depth>0 validity mask (for fair comparison
+    on the same rays).
+
+    Returns the list of saved file paths.
+    """
+    lidar_dir = os.path.join(output_dir, scene_name, f'sample_{sample_idx:04d}', 'lidar')
+    os.makedirs(lidar_dir, exist_ok=True)
+
+    raster_pts = lidar_gt['raster_pts']  # [B, H, W, 4]: [az(deg), el(deg), _, _]
+    az_rad = torch.deg2rad(raster_pts[..., 0:1])  # [B, H, W, 1]
+    el_rad = torch.deg2rad(raster_pts[..., 1:2])  # [B, H, W, 1]
+    cos_el = torch.cos(el_rad)
+    lidar_to_ego = torch.linalg.inv(lidar_gt['viewmat']).reshape(1, 4, 4)
+
+    def _ego_points(depth):
+        pts_lidar = torch.cat([
+            depth * cos_el * torch.cos(az_rad),
+            depth * cos_el * torch.sin(az_rad),
+            depth * torch.sin(el_rad),
+        ], dim=-1)  # [B, H, W, 3]
+        ones = torch.ones_like(pts_lidar[..., :1])
+        pts_h = torch.cat([pts_lidar, ones], dim=-1)  # [B, H, W, 4]
+        return torch.matmul(pts_h, lidar_to_ego.transpose(1, 2))[..., :3]  # [B, H, W, 3]
+
+    def _write_ply(path, pts, depth, intensity, valid_extra=None):
+        pts_np = pts[0].reshape(-1, 3).detach().cpu().numpy()
+        d_np = depth[0].reshape(-1).detach().cpu().numpy()
+        i_np = intensity[0].reshape(-1).detach().cpu().numpy()
+        valid = d_np > 0
+        if valid_extra is not None:
+            valid = valid & valid_extra
+        pts_np, d_np, i_np = pts_np[valid], d_np[valid], i_np[valid]
+        n = pts_np.shape[0]
+        with open(path, 'w') as f:
+            f.write("ply\n")
+            f.write("format ascii 1.0\n")
+            f.write(f"element vertex {n}\n")
+            f.write("property float x\n")
+            f.write("property float y\n")
+            f.write("property float z\n")
+            f.write("property float intensity\n")
+            f.write("property float depth\n")
+            f.write("end_header\n")
+            for i in range(n):
+                f.write(
+                    f"{pts_np[i, 0]:.4f} {pts_np[i, 1]:.4f} {pts_np[i, 2]:.4f} "
+                    f"{i_np[i]:.4f} {d_np[i]:.4f}\n"
+                )
+        return n
+
+    saved_paths = []
+    gt_pts = _ego_points(lidar_gt['gt_depth'])
+    gt_path = os.path.join(lidar_dir, 'gt_points.ply')
+    _write_ply(gt_path, gt_pts, lidar_gt['gt_depth'], lidar_gt['gt_intensity'])
+    saved_paths.append(gt_path)
+
+    pred_pts = _ego_points(lidar_out['depth'])
+    pred_path = os.path.join(lidar_dir, 'pred_points.ply')
+    _write_ply(pred_path, pred_pts, lidar_out['depth'], lidar_out['intensity'])
+    saved_paths.append(pred_path)
+
+    # Pred points additionally masked by GT depth>0 (same rays as GT)
+    gt_valid = (lidar_gt['gt_depth'][0].reshape(-1).detach().cpu().numpy() > 0)
+    pred_mask_path = os.path.join(lidar_dir, 'pred_points_mask.ply')
+    _write_ply(pred_mask_path, pred_pts, lidar_out['depth'], lidar_out['intensity'], valid_extra=gt_valid)
+    saved_paths.append(pred_mask_path)
+
+    return saved_paths
+
+
 def save_lidar_bev(lidar_gt, lidar_out, scene_name, sample_idx, output_dir,
                    bev_x_range=50.0, bev_y_range=25.0, bev_res=0.2, max_depth=80.0):
     """
@@ -1195,7 +1347,7 @@ def save_lidar_bev(lidar_gt, lidar_out, scene_name, sample_idx, output_dir,
 
 
 def _run_single_gpu_inference(model, scene_dataloader, device, save_results=True, output_dir=None, novel_distances=[1.0, 2.0], eval_resolution='280x518',
-                              bev_x_range=50.0, bev_y_range=25.0, bev_resolution=0.2):
+                              bev_x_range=50.0, bev_y_range=25.0, bev_resolution=0.2, output_gs=False):
     """Run inference on all scenes - simplified using unified scene processing"""
     print(f"\nStarting scene-based inference on device: {device}")
     print(f"Number of scenes: {len(scene_dataloader)}")
@@ -1214,7 +1366,8 @@ def _run_single_gpu_inference(model, scene_dataloader, device, save_results=True
                                         save_renders=save_results, output_dir=output_dir,
                                         novel_distances=novel_distances, eval_resolution=eval_resolution,
                                         batch_idx=scene_idx, bev_x_range=bev_x_range,
-                                        bev_y_range=bev_y_range, bev_resolution=bev_resolution)
+                                        bev_y_range=bev_y_range, bev_resolution=bev_resolution,
+                                        output_gs=output_gs)
 
             all_scene_results.append(result)
             overall_psnr.extend(result['sample_metrics']['psnr_list'])
@@ -1425,6 +1578,9 @@ def main():
                        help='BEV lateral range (+/- meters around ego, left/right)')
     parser.add_argument('--bev_resolution', type=float, default=0.2,
                        help='BEV pixel resolution (meters per pixel)')
+    parser.add_argument('--gs', action='store_true',
+                       help='Save the scene 3D Gaussian assets as a PLY file '
+                            '(per sample: <sample>/gaussians.ply, ~600MB each)')
 
     args = parser.parse_args()
     
@@ -1479,6 +1635,7 @@ def main():
     print(f"Novel view distances: {novel_distances}")
     print(f"Evaluation resolution: {args.eval_resolution}")
     print(f"BEV range: x +/-{args.bev_x_range}m, y +/-{args.bev_y_range}m (orthographic), res {args.bev_resolution}m/px")
+    print(f"Save Gaussian assets (PLY): {args.gs}")
 
     # CRITICAL: Ensure batch_size is 1 before creating data module
     print(f"Original batch_size in config: {config['data_cfg'].get('batch_size', 'not set')}")
@@ -1530,6 +1687,7 @@ def main():
         bev_x_range=args.bev_x_range,
         bev_y_range=args.bev_y_range,
         bev_resolution=args.bev_resolution,
+        output_gs=args.gs,
     )
     
     print(f"\nScene-based inference completed successfully!")
