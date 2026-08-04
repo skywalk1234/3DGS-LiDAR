@@ -558,8 +558,10 @@ def _process_scene_batch(model, scene_batch, device, gpu_id=0, save_renders=True
                     gt_ray_drop_np = (gt_ray_drop.detach().cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
                     _save_lidar_map(gt_ray_drop_np, os.path.join(lidar_dir, 'gt_ray_drop.png'))
 
-                    # Compute LiDAR metrics
-                    valid = gt_depth > 0
+                    # Compute LiDAR metrics (only on GT returns farther than 1.5m,
+                    # matching the training depth mask; closer points are ego
+                    # self-scans that mislead depth evaluation)
+                    valid = gt_depth > 1.5
                     
                     # Depth L2 (MSE)
                     depth_sq = (pred_depth[valid] - gt_depth[valid]) ** 2
@@ -1173,10 +1175,13 @@ def save_lidar_ply(lidar_gt, lidar_out, scene_name, sample_idx, output_dir):
     PLY with x/y/z/intensity/depth properties to <sample>/lidar/gt_points.ply
     and <sample>/lidar/pred_points.ply. A third file
     <sample>/lidar/pred_points_mask.ply holds the predicted points additionally
-    masked by the GT depth>0 validity mask (for fair comparison on the same rays).
+    masked by the GT validity mask (for fair comparison on the same rays).
+    Points closer than MIN_LIDAR_DEPTH (1.5m) are dropped: they are usually
+    ego-vehicle self-scans that circle around the lidar.
 
     Returns the list of saved file paths.
     """
+    MIN_LIDAR_DEPTH = 1.5  # meters; drop ego self-scan points
     lidar_dir = os.path.join(output_dir, scene_name, f'sample_{sample_idx:04d}', 'lidar')
     os.makedirs(lidar_dir, exist_ok=True)
 
@@ -1200,7 +1205,7 @@ def save_lidar_ply(lidar_gt, lidar_out, scene_name, sample_idx, output_dir):
         pts_np = pts[0].reshape(-1, 3).detach().cpu().numpy()
         d_np = depth[0].reshape(-1).detach().cpu().numpy()
         i_np = intensity[0].reshape(-1).detach().cpu().numpy()
-        valid = d_np > 0
+        valid = d_np > MIN_LIDAR_DEPTH
         if valid_extra is not None:
             valid = valid & valid_extra
         pts_np, d_np, i_np = pts_np[valid], d_np[valid], i_np[valid]
@@ -1246,8 +1251,8 @@ def save_lidar_ply(lidar_gt, lidar_out, scene_name, sample_idx, output_dir):
     _write_ply(pred_path, pred_pts, lidar_out['depth'], lidar_out['intensity'])
     saved_paths.append(pred_path)
 
-    # Pred points additionally masked by GT depth>0 (same rays as GT)
-    gt_valid = (lidar_gt['gt_depth'][0].reshape(-1).detach().cpu().numpy() > 0)
+    # Pred points additionally masked by GT validity (same rays as GT, >1.5m)
+    gt_valid = (lidar_gt['gt_depth'][0].reshape(-1).detach().cpu().numpy() > MIN_LIDAR_DEPTH)
     pred_mask_path = os.path.join(lidar_dir, 'pred_points_mask.ply')
     _write_ply(pred_mask_path, pred_pts, lidar_out['depth'], lidar_out['intensity'], valid_extra=gt_valid)
     saved_paths.append(pred_mask_path)
