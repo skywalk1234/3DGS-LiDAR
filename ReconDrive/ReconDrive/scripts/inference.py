@@ -1364,8 +1364,10 @@ def _run_single_gpu_inference(model, scene_dataloader, device, save_results=True
     with torch.no_grad():
         for scene_idx, scene_batch in enumerate(scene_dataloader):
 
-            # Get scene_idx from the batch efficiently
-            scene_batch['scene_idx'] = scene_idx
+            # Keep the scene's own scene_idx from the data module (real index into
+            # the dataset's scene list). Only fall back to the enumeration index
+            # when the batch does not carry one (e.g. pre-loaded samples).
+            scene_batch.setdefault('scene_idx', scene_idx)
 
             result = _process_scene_batch(model, scene_batch, device, gpu_id=0,
                                         save_renders=save_results, output_dir=output_dir,
