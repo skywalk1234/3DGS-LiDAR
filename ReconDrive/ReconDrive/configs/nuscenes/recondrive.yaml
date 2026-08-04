@@ -49,7 +49,7 @@ model_cfg:
   # LiDAR loss weights
   lambda_lidar_depth: 1.0
   lambda_lidar_intensity: 0.1
-  lambda_lidar_raydrop: 0.1
+  lambda_lidar_raydrop: 0.01
   lambda_depth_direct: 1.0     # Direct sparse depth L1 loss weight
   lidar_feat_dim: 16
 
