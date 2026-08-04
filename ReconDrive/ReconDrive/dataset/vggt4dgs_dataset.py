@@ -1028,7 +1028,6 @@ class NuScenesdataset4D(Dataset):
 
                     lidar_data = {
                         'raster_pts': torch.from_numpy(raster_pts).float(),
-                        'raw_points': torch.from_numpy(lidar_points).float(),
                         'viewmat': torch.from_numpy(ego_to_lidar).float()[None],
                         'tile_elevation_boundaries': torch.from_numpy(el_boundaries).float(),
                         'n_elevation_channels': torch.tensor(LIDAR_NUM_RINGS, dtype=torch.long),
