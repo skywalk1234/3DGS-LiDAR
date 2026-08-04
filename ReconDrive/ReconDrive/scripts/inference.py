@@ -916,12 +916,11 @@ def save_lidar_cam_overlays(lidar_gt, lidar_out, batch_render_data, batch_splati
         gt_out = os.path.join(lidar_cam_dir, f'cam_{cam_id}_gt_lidar_overlay.png')
         _make_overlay(gt_np, gt_uv, gt_z, gt_out)
 
-        # Save Pred overlay (unfiltered)
+        # Save Pred overlay
         pred_out = os.path.join(lidar_cam_dir, f'cam_{cam_id}_pred_lidar_overlay.png')
         _make_overlay(gt_np, pred_uv, pred_z, pred_out)
 
-        print(f"  GPU {0}: lidar_cam cam_{cam_id}: GT={len(gt_uv)}pts, "
-              f"Pred={len(pred_uv)}pts")
+        print(f"  GPU {0}: lidar_cam cam_{cam_id}: GT={len(gt_uv)}pts, Pred={len(pred_uv)}pts")
 
 
 
