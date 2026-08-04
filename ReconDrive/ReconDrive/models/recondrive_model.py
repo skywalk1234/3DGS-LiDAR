@@ -962,8 +962,8 @@ class ReconDrive_LITModelModule(pl.LightningModule):
         loss_depth_direct = torch.tensor(0.0, device=self.device)
         if hasattr(self, '_lidar_proj_data') and self._lidar_proj_data is not None:
             ld = self._lidar_proj_data
-            # 只用 GT 中 depth > 1.8m 的雷达点计算损失（过滤近处无效/噪声点）
-            mask = (ld['proj_mask'] > 0) & (ld['proj_depth'] > 1.8)  # [B*V, 1, H, W]
+            # 只用 GT 中 depth > 2.0m 的雷达点计算损失（过滤近处无效/噪声点）
+            mask = (ld['proj_mask'] > 0) & (ld['proj_depth'] > 2.0)  # [B*V, 1, H, W]
             if mask.sum() > 0:
                 loss_depth_direct = F.l1_loss(
                     ld['depth_maps_before'][mask],
@@ -1073,8 +1073,8 @@ class ReconDrive_LITModelModule(pl.LightningModule):
         loss_depth_direct = torch.tensor(0.0, device=self.device)
         if hasattr(self, '_lidar_proj_data') and self._lidar_proj_data is not None:
             ld = self._lidar_proj_data
-            # 只用 GT 中 depth > 1.8m 的雷达点计算损失（过滤近处无效/噪声点）
-            mask = (ld['proj_mask'] > 0) & (ld['proj_depth'] > 1.8)  # [B*V, 1, H, W]
+            # 只用 GT 中 depth > 2.0m 的雷达点计算损失（过滤近处无效/噪声点）
+            mask = (ld['proj_mask'] > 0) & (ld['proj_depth'] > 2.0)  # [B*V, 1, H, W]
             if mask.sum() > 0:
                 with torch.no_grad():
                     loss_depth_direct = F.l1_loss(
