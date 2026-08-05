@@ -141,6 +141,7 @@ ckpts/
 
 # work_dirs
 **/work_dirs
+**/work_dirs.tar.gz
 
 batchscript*
 phoenix*

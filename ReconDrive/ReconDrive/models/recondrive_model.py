@@ -958,17 +958,30 @@ class ReconDrive_LITModelModule(pl.LightningModule):
 
         batch_recontrast_data = self.get_recontrast_data(batch_input, batch_idx)
 
-        # ===== 新增稀疏深度 Loss (仅训练) =====
+        # ===== 稀疏深度 Loss (仅训练, 只监督残差头输出) =====
         loss_depth_direct = torch.tensor(0.0, device=self.device)
         if hasattr(self, '_lidar_proj_data') and self._lidar_proj_data is not None:
             ld = self._lidar_proj_data
             # 只用 GT 中 depth > 2.5m 的雷达点计算损失（过滤近处无效/噪声点）
             mask = (ld['proj_mask'] > 0) & (ld['proj_depth'] > 2.5)  # [B*V, 1, H, W]
             if mask.sum() > 0:
+                # 只监督残差头修正后的深度: detach 掉修正前的 depth_head 输出,
+                # 梯度只流向 depth_residual_head, depth_head 不受 depth_direct 影响
+                corrected_depth = ld['depth_maps_before'].detach() + ld['depth_residual']
                 loss_depth_direct = F.l1_loss(
-                    ld['depth_maps_before'][mask],
+                    corrected_depth[mask],
                     ld['proj_depth'][mask],
                 ) * self.lambda_depth_direct
+                # 打印 VGGT 深度 vs 雷达真值的尺度统计, 判断大 loss 是偏移还是尺度问题
+                if batch_idx % 20 == 0:
+                    with torch.no_grad():
+                        bm = ld['depth_maps_before'][mask]
+                        pd = ld['proj_depth'][mask]
+                        print(f"[DepthScale][train] step={self.global_step} n={int(mask.sum())} "
+                              f"VGGT: mean={bm.mean():.2f} p25={bm.quantile(0.25):.2f} p50={bm.quantile(0.5):.2f} "
+                              f"p75={bm.quantile(0.75):.2f} max={bm.max():.2f} | "
+                              f"LiDAR: mean={pd.mean():.2f} p25={pd.quantile(0.25):.2f} p50={pd.quantile(0.5):.2f} "
+                              f"p75={pd.quantile(0.75):.2f} max={pd.max():.2f}")
         self.log(f'{stage}/depth_direct', loss_depth_direct.item(),
                  on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
         # 及时释放图引用: 让 bv_depth 挂着的 VGGT autograd 图在渲染步骤前释放
@@ -1069,7 +1082,7 @@ class ReconDrive_LITModelModule(pl.LightningModule):
             self.all_render_frame_ids = [0]
         batch_recontrast_data = self.get_recontrast_data(batch_input)
 
-        # ===== 稀疏深度 Loss (验证) =====
+        # ===== 稀疏深度 Loss (验证, 只监督残差头输出) =====
         loss_depth_direct = torch.tensor(0.0, device=self.device)
         if hasattr(self, '_lidar_proj_data') and self._lidar_proj_data is not None:
             ld = self._lidar_proj_data
@@ -1077,10 +1090,20 @@ class ReconDrive_LITModelModule(pl.LightningModule):
             mask = (ld['proj_mask'] > 0) & (ld['proj_depth'] > 2.5)  # [B*V, 1, H, W]
             if mask.sum() > 0:
                 with torch.no_grad():
+                    corrected_depth = ld['depth_maps_before'] + ld['depth_residual']
                     loss_depth_direct = F.l1_loss(
-                        ld['depth_maps_before'][mask],
+                        corrected_depth[mask],
                         ld['proj_depth'][mask],
                     ) * self.lambda_depth_direct
+                # 打印 VGGT 深度 vs 雷达真值的尺度统计 (每 40 个 val batch 一次)
+                if batch_idx % 40 == 0:
+                    bm = ld['depth_maps_before'][mask]
+                    pd = ld['proj_depth'][mask]
+                    print(f"[DepthScale][val] step={self.global_step} n={int(mask.sum())} "
+                          f"VGGT: mean={bm.mean():.2f} p25={bm.quantile(0.25):.2f} p50={bm.quantile(0.5):.2f} "
+                          f"p75={bm.quantile(0.75):.2f} max={bm.max():.2f} | "
+                          f"LiDAR: mean={pd.mean():.2f} p25={pd.quantile(0.25):.2f} p50={pd.quantile(0.5):.2f} "
+                          f"p75={pd.quantile(0.75):.2f} max={pd.max():.2f}")
         self.log(f'{stage}/depth_direct', loss_depth_direct.item(),
                  on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
         # 及时释放图引用: 让 bv_depth 挂着的 VGGT autograd 图在渲染步骤前释放
@@ -1661,9 +1684,10 @@ class ReconDrive_LITModelModule(pl.LightningModule):
                 corrected_lidar_feat = bv_lidar_feat + lidar_feat_residual
                 lidar_feat_maps = rearrange(corrected_lidar_feat, '(b v) h w d -> b v h w d', b=batch_size, v=V)
 
-                # Store for sparse depth loss (on depth_maps BEFORE correction)
+                # Store for sparse depth loss (supervise residual-corrected depth)
                 self._lidar_proj_data = {
                     'depth_maps_before': bv_depth,  # [B*V, 1, H, W] before correction (keep grad for depth_head)
+                    'depth_residual': depth_residual,  # [B*V, 1, H, W] zero-init residual head output
                     'proj_depth': bv_proj_d,  # [B*V, 1, H, W]
                     'proj_mask': bv_proj_m,   # [B*V, 1, H, W]
                 }
