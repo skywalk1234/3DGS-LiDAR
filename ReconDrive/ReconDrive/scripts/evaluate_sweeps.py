@@ -31,6 +31,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL import Image as PILImage
+from PIL import Image
 
 # ------------------------------------------------------------------
 # Path setup (project root + models dir, mirroring trainer.py)
@@ -400,6 +401,9 @@ def render_sweep_lidar(
     lidar_to_ego0 = (
         np.linalg.inv(ego0_to_world) @ sweep_ego_to_world @ lidar_to_ego
     ).astype(np.float32)
+    lidar_to_ego0_t = (
+        torch.from_numpy(lidar_to_ego0).float().to(device)
+    )
     viewmat = (
         torch.from_numpy(np.linalg.inv(lidar_to_ego0)).float().to(device).unsqueeze(0)
     )
@@ -470,6 +474,8 @@ def render_sweep_lidar(
         "gt_depth": gt_depth_t,
         "gt_intensity": gt_intensity_t,
         "gt_ray_drop": gt_ray_drop_t,
+        "viewmat": viewmat,
+        "lidar_to_ego0": lidar_to_ego0_t,
         "raster_pts": raster_pts,
         "points": points,
         "lidar_to_ego": lidar_to_ego,
@@ -568,6 +574,7 @@ def run_sweep_evaluation(
     save_renders: bool,
     output_dir: Path,
     sanity_zero: bool = False,
+    save_views: bool = False,
 ) -> dict[str, Any]:
     dataset = scene_batch["dataset"]
     scene_length = scene_batch["scene_length"]
@@ -662,6 +669,11 @@ def run_sweep_evaluation(
                         _save_sweep_render(
                             output_dir, scene_name, sample_idx, cam, sweep, pred_eval, gt_eval
                         )
+                    if save_views:
+                        _save_sweep_gt_views(
+                            output_dir, scene_name, sample_idx, sweep,
+                            pred_eval, gt_eval, cam, cam_idx,
+                        )
 
             # ---- lidar sweeps ----
             lid_kf0_ts, lid_kfN_ts = ctx.keyframe_timestamps(LIDAR_CHANNEL)
@@ -669,6 +681,10 @@ def run_sweep_evaluation(
                 (lid_kfN_ts - lid_kf0_ts) / 1e6 if lid_kfN_ts > lid_kf0_ts else span_seconds
             )
             lidar_ego0_to_world = ctx.keyframe_ego_pose(LIDAR_CHANNEL)
+            lidar_sweep_data: list[tuple[dict[str, Any], dict[str, Any]]] = []
+            camera_sweep_records: dict[str, list[dict[str, Any]]] = {
+                cam: list(ctx.camera_sweeps(cam)) for cam in CAMERA_CHANNELS
+            }
             for sweep in ctx.lidar_sweeps():
                 t_seconds = (int(sweep["timestamp"]) - lid_kf0_ts) / 1e6
                 pred = render_sweep_lidar(
@@ -691,6 +707,27 @@ def run_sweep_evaluation(
                     **metrics,
                 }
                 lidar_samples.append(sample)
+                if save_views:
+                    lidar_sweep_data.append((dict(sweep), pred))
+
+            # ---- save lidar PLY + lidar_cam per sweep ----
+            if save_views:
+                for sweep_record, lidar_pred in lidar_sweep_data:
+                    _save_sweep_lidar_ply(
+                        output_dir, scene_name, sample_idx, sweep_record, lidar_pred,
+                    )
+                    _save_sweep_lidar_cam(
+                        lidar_pred,
+                        camera_sweep_records,
+                        lidar_timestamp_us=int(sweep_record["timestamp"]),
+                        data_root=data_root,
+                        output_dir=output_dir,
+                        scene_name=scene_name,
+                        sample_idx=sample_idx,
+                        tables=tables,
+                        render_h=model.render_height,
+                        render_w=model.render_width,
+                    )
 
             # ---- sanity check: render frame-0 keyframes (t=0) with the same
             # pipeline, to compare against the model's own frame-0 baseline ----
@@ -805,6 +842,262 @@ def _save_sweep_render(
         PILImage.fromarray(img).save(folder / name)
 
 
+# ------------------------------------------------------------------
+#  Save helpers: gt_views / lidar / lidar_cam (matching inference.py)
+# ------------------------------------------------------------------
+def _save_sweep_gt_views(
+    output_dir: Path,
+    scene_name: str,
+    sample_idx: int,
+    sweep_record: Mapping[str, Any],
+    pred: torch.Tensor,
+    gt: torch.Tensor,
+    cam: str,
+    cam_idx: int,
+) -> None:
+    """Save pred/gt camera images in gt_views/ format (same as inference.py)."""
+    folder = (
+        output_dir
+        / scene_name
+        / f"sample_{int(sample_idx):04d}"
+        / f"sweep_{sweep_record['timestamp']}"
+        / "gt_views"
+        / cam
+    )
+    folder.mkdir(parents=True, exist_ok=True)
+    for name, tensor in (("pred.png", pred), ("gt.png", gt)):
+        img = tensor[0].detach().cpu().numpy().transpose(1, 2, 0)
+        img = np.clip(img * 255.0, 0, 255).astype(np.uint8)
+        PILImage.fromarray(img).save(folder / name)
+
+
+def _save_sweep_lidar_ply(
+    output_dir: Path,
+    scene_name: str,
+    sample_idx: int,
+    sweep_record: Mapping[str, Any],
+    lidar_pred: Mapping[str, Any],
+    min_depth: float = 2.5,
+) -> list[str]:
+    """Save GT/pred LiDAR point clouds as PLY, same format as inference.py."""
+    folder = (
+        output_dir
+        / scene_name
+        / f"sample_{int(sample_idx):04d}"
+        / f"sweep_{sweep_record['timestamp']}"
+        / "lidar"
+    )
+    folder.mkdir(parents=True, exist_ok=True)
+
+    raster_pts = lidar_pred["raster_pts"]  # [B, H, W, 4]
+    az_rad = torch.deg2rad(raster_pts[..., 0:1])
+    el_rad = torch.deg2rad(raster_pts[..., 1:2])
+    cos_el = torch.cos(el_rad)
+    lidar_to_ego0 = lidar_pred["lidar_to_ego0"]  # [4, 4]
+
+    def _ego_points(depth: torch.Tensor) -> torch.Tensor:
+        pts_lidar = torch.cat([
+            depth * cos_el * torch.cos(az_rad),
+            depth * cos_el * torch.sin(az_rad),
+            depth * torch.sin(el_rad),
+        ], dim=-1)  # [B, H, W, 3]
+        ones = torch.ones_like(pts_lidar[..., :1])
+        pts_h = torch.cat([pts_lidar, ones], dim=-1)
+        l2e = lidar_to_ego0.reshape(1, 4, 4).to(pts_h.device)
+        return torch.matmul(pts_h, l2e.transpose(1, 2))[..., :3]
+
+    def _write_ply(path: str, pts: torch.Tensor, depth: torch.Tensor,
+                   intensity: torch.Tensor, valid_extra=None) -> int:
+        pts_np = pts[0].reshape(-1, 3).detach().cpu().numpy()
+        d_np = depth[0].reshape(-1).detach().cpu().numpy()
+        i_np = intensity[0].reshape(-1).detach().cpu().numpy()
+        valid = d_np > min_depth
+        if valid_extra is not None:
+            valid = valid & valid_extra
+        pts_np, d_np, i_np = pts_np[valid], d_np[valid], i_np[valid]
+        n = pts_np.shape[0]
+        with open(path, "w") as f:
+            f.write("ply\n")
+            f.write("format ascii 1.0\n")
+            f.write(f"element vertex {n}\n")
+            f.write("property float x\n")
+            f.write("property float y\n")
+            f.write("property float z\n")
+            f.write("property float intensity\n")
+            f.write("property float depth\n")
+            f.write("end_header\n")
+            for j in range(n):
+                f.write(
+                    f"{pts_np[j, 0]:.4f} {pts_np[j, 1]:.4f} {pts_np[j, 2]:.4f} "
+                    f"{i_np[j]:.4f} {d_np[j]:.4f}\n"
+                )
+        return n
+
+    saved = []
+    gt_pts = _ego_points(lidar_pred["gt_depth"])
+    gt_path = str(folder / "gt_points.ply")
+    _write_ply(gt_path, gt_pts, lidar_pred["gt_depth"], lidar_pred["gt_intensity"])
+    saved.append(gt_path)
+
+    pred_pts = _ego_points(lidar_pred["depth"])
+    pred_path = str(folder / "pred_points.ply")
+    _write_ply(pred_path, pred_pts, lidar_pred["depth"], lidar_pred["intensity"])
+    saved.append(pred_path)
+
+    gt_valid = (lidar_pred["gt_depth"][0].reshape(-1).detach().cpu().numpy() > min_depth)
+    pred_mask_path = str(folder / "pred_points_mask.ply")
+    _write_ply(pred_mask_path, pred_pts, lidar_pred["depth"], lidar_pred["intensity"],
+               valid_extra=gt_valid)
+    saved.append(pred_mask_path)
+
+    return saved
+
+
+def _save_sweep_lidar_cam(
+    lidar_pred: Mapping[str, Any],
+    camera_sweep_records: dict[str, list[dict[str, Any]]],
+    *,
+    lidar_timestamp_us: int,
+    data_root: Path,
+    output_dir: Path,
+    scene_name: str,
+    sample_idx: int,
+    tables: NuscTables,
+    render_h: int,
+    render_w: int,
+    max_depth: float = 80.0,
+    point_radius: int = 1,
+    alpha: float = 0.8,
+) -> None:
+    """Overlay LiDAR sweep points onto nearby camera sweep GT images.
+
+    For each camera channel, finds the sweep nearest to the lidar timestamp,
+    loads its GT image, and projects GT/pred LiDAR points onto it.
+    """
+    folder = (
+        output_dir
+        / scene_name
+        / f"sample_{int(sample_idx):04d}"
+        / f"sweep_{lidar_timestamp_us}"
+        / "lidar_cam"
+    )
+    folder.mkdir(parents=True, exist_ok=True)
+
+    # Build 3D points in LiDAR frame from range image
+    raster_pts = lidar_pred["raster_pts"]  # [B, H, W, 4]
+    az_rad = torch.deg2rad(raster_pts[..., 0:1])
+    el_rad = torch.deg2rad(raster_pts[..., 1:2])
+    cos_el = torch.cos(el_rad)
+    gt_depth = lidar_pred["gt_depth"]
+    pred_depth = lidar_pred["depth"]
+    gt_pts_3d = torch.cat([
+        gt_depth * cos_el * torch.cos(az_rad),
+        gt_depth * cos_el * torch.sin(az_rad),
+        gt_depth * torch.sin(el_rad),
+    ], dim=-1)
+    pred_pts_3d = torch.cat([
+        pred_depth * cos_el * torch.cos(az_rad),
+        pred_depth * cos_el * torch.sin(az_rad),
+        pred_depth * torch.sin(el_rad),
+    ], dim=-1)
+
+    device = gt_depth.device
+    lidar_to_ego0 = lidar_pred["lidar_to_ego0"].reshape(1, 4, 4)
+
+    for cam_idx, cam in enumerate(CAMERA_CHANNELS):
+        camera_sweeps = camera_sweep_records.get(cam, [])
+        if not camera_sweeps:
+            continue
+        # Find camera sweep closest to this lidar timestamp
+        nearest = min(camera_sweeps, key=lambda s: abs(int(s["timestamp"]) - lidar_timestamp_us))
+
+        # Load GT image
+        gt_np = np.ascontiguousarray(load_sweep_image(data_root, nearest))
+        gt = (
+            torch.from_numpy(gt_np)
+            .permute(2, 0, 1)
+            .unsqueeze(0)
+            .float()
+            .to(device)
+            / 255.0
+        )
+        gt = F.interpolate(
+            gt, size=(render_h, render_w), mode="bilinear", align_corners=False,
+        )
+        gt_np_img = gt[0].permute(1, 2, 0).clamp(0, 1).cpu().numpy()
+
+        # Camera pose at the lidar time (using lidar's ego, camera's calibration)
+        sweep_ego = tables.ego_pose[nearest["ego_pose_token"]]
+        sweep_ego_to_world = pose_matrix(sweep_ego["translation"], sweep_ego["rotation"])
+        calibration = tables.calibrated_sensor[nearest["calibrated_sensor_token"]]
+        camera_to_ego = pose_matrix(calibration["translation"], calibration["rotation"])
+        # ego0_to_world from the nearest camera sweep's context is not available
+        # here; derive ego0 from the lidar sweep: work in ego_sweep frame instead.
+        camera_to_ego_sweep = np.linalg.inv(sweep_ego_to_world) @ sweep_ego_to_world @ camera_to_ego
+        e2c_extr = torch.from_numpy(np.linalg.inv(camera_to_ego_sweep)).float().to(device).unsqueeze(0)
+
+        # Intrinsics
+        intrinsics = np.asarray(calibration["camera_intrinsic"], dtype=np.float64)
+        native_w, native_h = int(nearest["width"]), int(nearest["height"])
+        k_scaled = np.eye(3, dtype=np.float64)
+        k_scaled[0, 0] = intrinsics[0, 0] * (render_w / native_w)
+        k_scaled[1, 1] = intrinsics[1, 1] * (render_h / native_h)
+        k_scaled[0, 2] = intrinsics[0, 2] * (render_w / native_w)
+        k_scaled[1, 2] = intrinsics[1, 2] * (render_h / native_h)
+        K = torch.as_tensor(k_scaled, dtype=torch.float32, device=device)
+
+        def _project(pts_3d: torch.Tensor, e2c: torch.Tensor, K_mat: torch.Tensor):
+            pts_flat = pts_3d[0].reshape(-1, 3)
+            e2c_4x4 = e2c[0]
+            l2e_4x4 = lidar_to_ego0[0]
+            cam_t_lidar = torch.mm(e2c_4x4, l2e_4x4)
+            ones = torch.ones(pts_flat.shape[0], 1, device=device, dtype=pts_flat.dtype)
+            pts_h = torch.cat([pts_flat, ones], dim=-1)
+            pts_cam = torch.mm(pts_h, cam_t_lidar.T)[:, :3]
+            front = pts_cam[:, 2] > 0
+            pts_front = pts_cam[front]
+            if pts_front.shape[0] == 0:
+                return np.zeros((0, 2)), np.zeros(0)
+            uv_h = torch.mm(pts_front, K_mat.T)
+            uv_h[:, :2] /= uv_h[:, 2:3]
+            u, v, z = uv_h[:, 0], uv_h[:, 1], uv_h[:, 2]
+            in_bounds = (u >= 0) & (u < render_w) & (v >= 0) & (v < render_h)
+            res = torch.stack([u[in_bounds], v[in_bounds]], dim=-1)
+            return res.cpu().numpy(), z[in_bounds].cpu().numpy()
+
+        gt_uv, gt_z = _project(gt_pts_3d, e2c_extr, K)
+        pred_uv, pred_z = _project(pred_pts_3d, e2c_extr, K)
+
+        def _make_overlay(base: np.ndarray, uv: np.ndarray, z_vals: np.ndarray, path: str):
+            overlay = base.copy()
+            h, w = overlay.shape[:2]
+            if len(uv) == 0:
+                Image.fromarray((overlay * 255).astype(np.uint8)).save(path)
+                return
+            depth_norm = np.clip(z_vals / max_depth, 0, 1)
+            colors = np.zeros((len(z_vals), 3))
+            colors[:, 0] = depth_norm
+            colors[:, 1] = 1.0 - np.abs(depth_norm - 0.5) * 2
+            colors[:, 2] = 1.0 - depth_norm
+            colors = np.clip(colors, 0, 1)
+            u_c = np.round(uv[:, 0]).astype(int)
+            v_c = np.round(uv[:, 1]).astype(int)
+            order = np.argsort(-z_vals)
+            u_c, v_c, colors = u_c[order], v_c[order], colors[order]
+            for i in range(len(u_c)):
+                col = colors[i]
+                for dy in range(-point_radius, point_radius + 1):
+                    for dx in range(-point_radius, point_radius + 1):
+                        if dx * dx + dy * dy <= point_radius * point_radius:
+                            ud, vd = u_c[i] + dx, v_c[i] + dy
+                            if 0 <= ud < w and 0 <= vd < h:
+                                overlay[vd, ud] = (1 - alpha) * overlay[vd, ud] + alpha * col
+            Image.fromarray((np.clip(overlay, 0, 1) * 255).astype(np.uint8)).save(path)
+
+        _make_overlay(gt_np_img, gt_uv, gt_z, str(folder / f"cam_{cam_idx}_gt_lidar_overlay.png"))
+        _make_overlay(gt_np_img, pred_uv, pred_z, str(folder / f"cam_{cam_idx}_pred_lidar_overlay.png"))
+
+
 def _mean_std(values: Sequence[float]) -> dict[str, float]:
     if not values:
         return {"mean": float("nan"), "std": float("nan"), "count": 0}
@@ -857,6 +1150,10 @@ def main() -> int:
         "--sanity_zero", action="store_true",
         help="also render frame-0 keyframes (t=0) for baseline comparison",
     )
+    parser.add_argument(
+        "--save_views", action="store_true",
+        help="save gt_views/, lidar/ PLY, and lidar_cam/ overlays (like inference.py)",
+    )
     args = parser.parse_args()
 
     with open(args.cfg_path) as handle:
@@ -908,6 +1205,7 @@ def main() -> int:
             save_renders=args.save_renders,
             output_dir=output_dir,
             sanity_zero=args.sanity_zero,
+            save_views=args.save_views,
         )
         all_results.append(result)
         summary = aggregate_scene_metrics(result)
