@@ -860,9 +860,10 @@ def _save_sweep_gt_views(
         output_dir
         / scene_name
         / f"sample_{int(sample_idx):04d}"
-        / f"sweep_{sweep_record['timestamp']}"
-        / "gt_views"
+        / "camera"
         / cam
+        / str(sweep_record["timestamp"])
+        / "gt_views"
     )
     folder.mkdir(parents=True, exist_ok=True)
     for name, tensor in (("pred.png", pred), ("gt.png", gt)):
@@ -884,7 +885,8 @@ def _save_sweep_lidar_ply(
         output_dir
         / scene_name
         / f"sample_{int(sample_idx):04d}"
-        / f"sweep_{sweep_record['timestamp']}"
+        / "lidar"
+        / str(sweep_record["timestamp"])
         / "lidar"
     )
     folder.mkdir(parents=True, exist_ok=True)
@@ -978,7 +980,8 @@ def _save_sweep_lidar_cam(
         output_dir
         / scene_name
         / f"sample_{int(sample_idx):04d}"
-        / f"sweep_{lidar_timestamp_us}"
+        / "lidar"
+        / str(lidar_timestamp_us)
         / "lidar_cam"
     )
     folder.mkdir(parents=True, exist_ok=True)
@@ -1065,8 +1068,12 @@ def _save_sweep_lidar_cam(
             res = torch.stack([u[in_bounds], v[in_bounds]], dim=-1)
             return res.cpu().numpy(), z[in_bounds].cpu().numpy()
 
-        gt_uv, gt_z = _project(gt_pts_3d, e2c_extr, K)
-        pred_uv, pred_z = _project(pred_pts_3d, e2c_extr, K)
+        # Only keep points with depth > 2.5m
+        gt_valid = gt_depth > 2.5  # [B, H, W, 1] -> broadcasts with [B, H, W, 3]
+        pred_valid = pred_depth > 2.5
+
+        gt_uv, gt_z = _project(gt_pts_3d * gt_valid.float(), e2c_extr, K)
+        pred_uv, pred_z = _project(pred_pts_3d * pred_valid.float(), e2c_extr, K)
 
         def _make_overlay(base: np.ndarray, uv: np.ndarray, z_vals: np.ndarray, path: str):
             overlay = base.copy()
