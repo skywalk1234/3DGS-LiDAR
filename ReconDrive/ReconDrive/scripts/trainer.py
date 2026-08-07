@@ -39,6 +39,25 @@ def load_and_merge_configs(main_cfg_path):
     return main_cfg
 
 
+class EpochScheduledCheckpoint(pl.Callback):
+    """Save a checkpoint at specific epochs (0-indexed, matching epoch_{epoch:02d} naming).
+
+    E.g. epochs=[20, 40, 60, 80] saves epoch_20.ckpt / epoch_40.ckpt / ... on top of
+    last.ckpt / best_module.ckpt when --save_last_only is used.
+    """
+    def __init__(self, dirpath, epochs, filename='epoch_{epoch:02d}'):
+        super().__init__()
+        self.dirpath = dirpath
+        self.epochs = set(epochs)
+        self.filename = filename
+
+    def on_train_epoch_end(self, trainer, pl_module):
+        if trainer.current_epoch in self.epochs:
+            os.makedirs(self.dirpath, exist_ok=True)
+            path = os.path.join(self.dirpath, self.filename.format(epoch=trainer.current_epoch) + '.ckpt')
+            trainer.save_checkpoint(path)
+
+
 def main():
     parser = argparse.ArgumentParser(description='eval argparse')
     parser.add_argument('--cfg_path', type=str, required=True, help='Main config file path')
@@ -135,6 +154,9 @@ def main():
     callbacks = [checkpoint_callback, LearningRateMonitor(), export_metric_callback]
     if not args.save_last_only:
         callbacks.insert(1, periodic_checkpoint_callback)
+    else:
+        # save_last_only 模式下，额外在关键 epoch（20/40/60/80）存快照
+        callbacks.append(EpochScheduledCheckpoint(ckpt_dir, epochs=[20, 40, 60, 80]))
 
     trainer = pl.Trainer(
         max_epochs=main_cfg.get('train_epoch', 50),
