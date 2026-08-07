@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import multiprocessing as mp
 import os
 import sys
 import time
@@ -497,7 +498,7 @@ def compute_lidar_sweep_metrics(pred: Mapping[str, Any]) -> dict[str, float]:
     pred_ray_drop = _squeeze(pred["ray_drop_logits"].sigmoid())
     raster_pts = _squeeze(pred["raster_pts"])
 
-    valid = gt_depth > 2.5
+    valid = (gt_depth > 2.5) & (gt_depth < 80.0)
     metrics: dict[str, float] = {}
     if not bool(valid.any()):
         return {
@@ -573,7 +574,6 @@ def run_sweep_evaluation(
     scene_idx: int,
     save_renders: bool,
     output_dir: Path,
-    sanity_zero: bool = False,
     save_views: bool = False,
 ) -> dict[str, Any]:
     dataset = scene_batch["dataset"]
@@ -613,12 +613,18 @@ def run_sweep_evaluation(
 
             ctx = SweepContext(tables, frame0_token, frameN_token)
 
-            # ---- camera sweeps ----
+            # ---- camera sweeps (including frame 0 and frame N keyframes) ----
             for cam_idx, cam in enumerate(CAMERA_CHANNELS):
                 kf0_ts, kfN_ts = ctx.keyframe_timestamps(cam)
                 span_cam = (kfN_ts - kf0_ts) / 1e6 if kfN_ts > kf0_ts else span_seconds
+                cam_sweeps_with_t = [
+                    (ctx.keyframes[cam]["start"], 0.0),
+                ]
                 for sweep in ctx.camera_sweeps(cam):
                     t_seconds = (int(sweep["timestamp"]) - kf0_ts) / 1e6
+                    cam_sweeps_with_t.append((sweep, t_seconds))
+                cam_sweeps_with_t.append((ctx.keyframes[cam]["end"], span_cam))
+                for sweep, t_seconds in cam_sweeps_with_t:
                     sweep_pose = ctx.sweep_pose_in_ego0(sweep, cam)
                     pred = render_sweep_camera(
                         model,
@@ -675,7 +681,7 @@ def run_sweep_evaluation(
                             pred_eval, gt_eval, cam, cam_idx,
                         )
 
-            # ---- lidar sweeps ----
+            # ---- lidar sweeps (including frame 0 and frame N keyframes) ----
             lid_kf0_ts, lid_kfN_ts = ctx.keyframe_timestamps(LIDAR_CHANNEL)
             span_lid = (
                 (lid_kfN_ts - lid_kf0_ts) / 1e6 if lid_kfN_ts > lid_kf0_ts else span_seconds
@@ -685,8 +691,14 @@ def run_sweep_evaluation(
             camera_sweep_records: dict[str, list[dict[str, Any]]] = {
                 cam: list(ctx.camera_sweeps(cam)) for cam in CAMERA_CHANNELS
             }
+            lidar_sweeps_with_t = [
+                (ctx.keyframes[LIDAR_CHANNEL]["start"], 0.0),
+            ]
             for sweep in ctx.lidar_sweeps():
                 t_seconds = (int(sweep["timestamp"]) - lid_kf0_ts) / 1e6
+                lidar_sweeps_with_t.append((sweep, t_seconds))
+            lidar_sweeps_with_t.append((ctx.keyframes[LIDAR_CHANNEL]["end"], span_lid))
+            for sweep, t_seconds in lidar_sweeps_with_t:
                 pred = render_sweep_lidar(
                     model,
                     recontrast,
@@ -728,86 +740,6 @@ def run_sweep_evaluation(
                         render_h=model.render_height,
                         render_w=model.render_width,
                     )
-
-            # ---- sanity check: render frame-0 keyframes (t=0) with the same
-            # pipeline, to compare against the model's own frame-0 baseline ----
-            if sanity_zero:
-                for cam_idx, cam in enumerate(CAMERA_CHANNELS):
-                    kf = ctx.keyframes[cam]["start"]
-                    pose = ctx.sweep_pose_in_ego0(kf, cam)  # == c2e_extr at t=0
-                    pred = render_sweep_camera(
-                        model,
-                        recontrast,
-                        kf,
-                        pose,
-                        t_seconds=0.0,
-                        span_seconds=span_seconds,
-                        tables=tables,
-                    )["image"]
-                    gt_np = np.ascontiguousarray(load_sweep_image(data_root, kf))
-                    gt = (
-                        torch.from_numpy(gt_np)
-                        .permute(2, 0, 1)
-                        .unsqueeze(0)
-                        .float()
-                        .to(device)
-                        / 255.0
-                    )
-                    gt = F.interpolate(
-                        gt,
-                        size=(model.render_height, model.render_width),
-                        mode="bilinear",
-                        align_corners=False,
-                    )
-                    camera_samples.append(
-                        {
-                            "sample_idx": int(sample_idx),
-                            "camera": cam,
-                            "cam_idx": int(cam_idx),
-                            "sweep_token": "sanity_frame0",
-                            "sweep_timestamp_us": int(kf["timestamp"]),
-                            "t_seconds": 0.0,
-                            "t_normalized": 0.0,
-                            "psnr": float(
-                                model.compute_psnr(gt.clamp(0, 1), pred.clamp(0, 1))
-                                .mean()
-                                .item()
-                            ),
-                            "ssim": float(
-                                model.compute_ssim(gt.clamp(0, 1), pred.clamp(0, 1))
-                                .mean()
-                                .item()
-                            ),
-                            "lpips": float(
-                                model.compute_lpips(gt.clamp(0, 1), pred.clamp(0, 1))
-                                .mean()
-                                .item()
-                            ),
-                            "sanity_zero": True,
-                        }
-                    )
-                kf_lidar = ctx.keyframes[LIDAR_CHANNEL]["start"]
-                pred_lidar = render_sweep_lidar(
-                    model,
-                    recontrast,
-                    kf_lidar,
-                    data_root,
-                    t_seconds=0.0,
-                    span_seconds=span_seconds,
-                    tables=tables,
-                    ego0_to_world=lidar_ego0_to_world,
-                )
-                lidar_samples.append(
-                    {
-                        "sample_idx": int(sample_idx),
-                        "sweep_token": "sanity_frame0_lidar",
-                        "sweep_timestamp_us": int(kf_lidar["timestamp"]),
-                        "t_seconds": 0.0,
-                        "t_normalized": 0.0,
-                        **compute_lidar_sweep_metrics(pred_lidar),
-                        "sanity_zero": True,
-                    }
-                )
 
     result = {
         "scene_idx": int(scene_idx),
@@ -1120,8 +1052,8 @@ def _mean_std(values: Sequence[float]) -> dict[str, float]:
 
 
 def aggregate_scene_metrics(scene_result: Mapping[str, Any]) -> dict[str, Any]:
-    cam = [item for item in scene_result["camera_sweeps"] if not item.get("sanity_zero")]
-    lid = [item for item in scene_result["lidar_sweeps"] if not item.get("sanity_zero")]
+    cam = scene_result["camera_sweeps"]
+    lid = scene_result["lidar_sweeps"]
     aggregate = {
         "scene_name": scene_result["scene_name"],
         "camera_sweep_count": len(cam),
@@ -1143,20 +1075,99 @@ def aggregate_scene_metrics(scene_result: Mapping[str, Any]) -> dict[str, Any]:
     return aggregate
 
 
+def gpu_worker(
+    gpu_id: int,
+    num_gpus: int,
+    args: argparse.Namespace,
+    config: dict,
+    output_dir: Path,
+) -> None:
+    """Process a subset of scenes on a single GPU (round-robin assignment).
+
+    This function runs in a spawned subprocess so every CUDA / model / dataset
+    resource is created independently inside the worker.
+    """
+    device = torch.device(f"cuda:{gpu_id}" if torch.cuda.is_available() else "cpu")
+    print(f"[GPU {gpu_id}] Device: {device}", flush=True)
+
+    model = ReconDrive_LITModelModule(cfg=config["model_cfg"], save_dir=".", logger=None)
+    model.load_pretrained_checkpoint(args.restore_ckpt)
+    model.to(device)
+    model.eval()
+
+    data_module = VGGT3DGS_SceneDataModule(cfg=config["data_cfg"])
+    data_module.setup(stage="test")
+    scene_dataloader = data_module.test_scene_dataloader()
+
+    data_root = Path(config["data_cfg"]["data_path"])
+    version = str(config["data_cfg"].get("nuscenes_version", "v1.0-mini"))
+    tables = NuscTables(data_root, version)
+    context_span = int(config["data_cfg"].get("context_span", 1))
+
+    scene_processed = 0
+    started = time.time()
+
+    for scene_idx, scene_batch in enumerate(scene_dataloader):
+        if scene_idx % num_gpus != gpu_id:
+            continue
+        if args.max_scenes is not None and scene_idx >= args.max_scenes:
+            break
+        if args.scene is not None and scene_batch["scene_name"] != args.scene:
+            continue
+
+        scene_processed += 1
+        print(
+            f"\n[GPU {gpu_id}] === {scene_batch['scene_name']} ===", flush=True,
+        )
+        result = run_sweep_evaluation(
+            model,
+            scene_batch,
+            tables,
+            data_root=data_root,
+            device=device,
+            frame_skip=args.frame_skip,
+            context_span=context_span,
+            scene_idx=scene_idx,
+            save_renders=args.save_renders,
+            output_dir=output_dir,
+            save_views=args.save_views,
+        )
+        summary = aggregate_scene_metrics(result)
+        print(
+            f"[GPU {gpu_id}] {scene_batch['scene_name']}: "
+            f"cam_sweeps={summary['camera_sweep_count']} "
+            f"lidar_sweeps={summary['lidar_sweep_count']} "
+            f"psnr={summary['camera_psnr']['mean']:.3f} "
+            f"depth_l2={summary['lidar_depth_l2']['mean']:.3f}",
+            flush=True,
+        )
+        with open(
+            output_dir / f"{result['scene_name']}_sweep_evaluation.json", "w",
+        ) as handle:
+            json.dump(result, handle, indent=2, sort_keys=True)
+
+    elapsed = time.time() - started
+    print(
+        f"[GPU {gpu_id}] Finished {scene_processed} scenes in {elapsed:.1f}s",
+        flush=True,
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="ReconDrive sweep-time evaluation")
     parser.add_argument("--cfg_path", type=str, required=True)
     parser.add_argument("--restore_ckpt", type=str, required=True)
     parser.add_argument("--output_dir", type=str, required=True)
     parser.add_argument("--device", type=str, default="cuda:0")
+    parser.add_argument(
+        "--gpus", type=str, default=None,
+        help="Comma-separated GPU IDs for multi-GPU inference, e.g. '0,1,2,3'. "
+             "When set, --device is ignored and scenes are distributed round-robin.",
+    )
     parser.add_argument("--scene", type=str, default=None)
     parser.add_argument("--max_scenes", type=int, default=None)
     parser.add_argument("--frame_skip", type=int, default=6)
     parser.add_argument("--save_renders", action="store_true")
-    parser.add_argument(
-        "--sanity_zero", action="store_true",
-        help="also render frame-0 keyframes (t=0) for baseline comparison",
-    )
     parser.add_argument(
         "--save_views", action="store_true",
         help="save gt_views/, lidar/ PLY, and lidar_cam/ overlays (like inference.py)",
@@ -1173,60 +1184,86 @@ def main() -> int:
     if "nuscenes_version" in config["data_cfg"]:
         config["model_cfg"]["nuscenes_version"] = config["data_cfg"]["nuscenes_version"]
 
-    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
-    print(f"Device: {device}")
-
-    model = ReconDrive_LITModelModule(cfg=config["model_cfg"], save_dir=".", logger=None)
-    model.load_pretrained_checkpoint(args.restore_ckpt)
-    model.to(device)
-    model.eval()
-
-    data_module = VGGT3DGS_SceneDataModule(cfg=config["data_cfg"])
-    data_module.setup(stage="test")
-    scene_dataloader = data_module.test_scene_dataloader()
-
-    data_root = Path(config["data_cfg"]["data_path"])
-    version = str(config["data_cfg"].get("nuscenes_version", "v1.0-mini"))
-    tables = NuscTables(data_root, version)
-    context_span = int(config["data_cfg"].get("context_span", 1))
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    all_results = []
-    started = time.time()
-    for scene_idx, scene_batch in enumerate(scene_dataloader):
-        if args.max_scenes is not None and len(all_results) >= args.max_scenes:
-            break
-        if args.scene is not None and scene_batch["scene_name"] != args.scene:
-            continue
-        print(f"\n=== Sweep evaluation: {scene_batch['scene_name']} ===", flush=True)
-        result = run_sweep_evaluation(
-            model,
-            scene_batch,
-            tables,
-            data_root=data_root,
-            device=device,
-            frame_skip=args.frame_skip,
-            context_span=context_span,
-            scene_idx=scene_idx,
-            save_renders=args.save_renders,
-            output_dir=output_dir,
-            sanity_zero=args.sanity_zero,
-            save_views=args.save_views,
-        )
-        all_results.append(result)
-        summary = aggregate_scene_metrics(result)
-        print(
-            f"  cam_sweeps={summary['camera_sweep_count']} "
-            f"lidar_sweeps={summary['lidar_sweep_count']} "
-            f"psnr={summary['camera_psnr']['mean']:.3f} "
-            f"depth_l2={summary['lidar_depth_l2']['mean']:.3f}",
-            flush=True,
-        )
-        with open(
-            output_dir / f"{result['scene_name']}_sweep_evaluation.json", "w"
-        ) as handle:
-            json.dump(result, handle, indent=2, sort_keys=True)
+    if args.gpus:
+        # ---- multi-GPU mode: spawn one process per GPU ----
+        gpu_ids = [int(x.strip()) for x in args.gpus.split(",")]
+        num_gpus = len(gpu_ids)
+        print(f"Launching {num_gpus} GPU workers on GPUs {gpu_ids}", flush=True)
+        started = time.time()
+
+        mp.set_start_method("spawn", force=True)
+        processes = []
+        for gpu_id in gpu_ids:
+            p = mp.Process(
+                target=gpu_worker,
+                args=(gpu_id, num_gpus, args, config, output_dir),
+            )
+            p.start()
+            processes.append(p)
+        for p in processes:
+            p.join()
+
+        # Collect per-scene results saved by each worker
+        all_results = []
+        for fpath in sorted(output_dir.glob("*_sweep_evaluation.json")):
+            with open(fpath) as handle:
+                all_results.append(json.load(handle))
+    else:
+        # ---- single-GPU mode ----
+        device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+        print(f"Device: {device}")
+
+        model = ReconDrive_LITModelModule(cfg=config["model_cfg"], save_dir=".", logger=None)
+        model.load_pretrained_checkpoint(args.restore_ckpt)
+        model.to(device)
+        model.eval()
+
+        data_module = VGGT3DGS_SceneDataModule(cfg=config["data_cfg"])
+        data_module.setup(stage="test")
+        scene_dataloader = data_module.test_scene_dataloader()
+
+        data_root = Path(config["data_cfg"]["data_path"])
+        version = str(config["data_cfg"].get("nuscenes_version", "v1.0-mini"))
+        tables = NuscTables(data_root, version)
+        context_span = int(config["data_cfg"].get("context_span", 1))
+
+        all_results = []
+        started = time.time()
+        for scene_idx, scene_batch in enumerate(scene_dataloader):
+            if args.max_scenes is not None and len(all_results) >= args.max_scenes:
+                break
+            if args.scene is not None and scene_batch["scene_name"] != args.scene:
+                continue
+            print(f"\n=== Sweep evaluation: {scene_batch['scene_name']} ===", flush=True)
+            result = run_sweep_evaluation(
+                model,
+                scene_batch,
+                tables,
+                data_root=data_root,
+                device=device,
+                frame_skip=args.frame_skip,
+                context_span=context_span,
+                scene_idx=scene_idx,
+                save_renders=args.save_renders,
+                output_dir=output_dir,
+                save_views=args.save_views,
+            )
+            all_results.append(result)
+            summary = aggregate_scene_metrics(result)
+            print(
+                f"  cam_sweeps={summary['camera_sweep_count']} "
+                f"lidar_sweeps={summary['lidar_sweep_count']} "
+                f"psnr={summary['camera_psnr']['mean']:.3f} "
+                f"depth_l2={summary['lidar_depth_l2']['mean']:.3f}",
+                flush=True,
+            )
+            with open(
+                output_dir / f"{result['scene_name']}_sweep_evaluation.json", "w"
+            ) as handle:
+                json.dump(result, handle, indent=2, sort_keys=True)
 
     overall: dict[str, Any] = {"scenes": [], "overall_metrics": {}}
     pooled_keys = {
