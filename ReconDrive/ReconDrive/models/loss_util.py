@@ -84,11 +84,14 @@ def compute_photometric_loss(pred=None, target=None):
 
 def compute_lidar_loss(pred_depth, gt_depth, pred_intensity, gt_intensity,
                        pred_ray_drop_logits, gt_ray_drop,
-                       lambda_depth=1.0, lambda_intensity=0.1, lambda_raydrop=0.01):
+                       lambda_depth=1.0, lambda_intensity=0.1, lambda_raydrop=0.01,
+                       max_depth=None):
     # Only supervise depth on GT returns farther than 2.5m.
     # Points closer than 2.5m are usually the ego-vehicle self-scans
     # (points circling around the lidar), which mislead depth learning.
     valid = (gt_depth > 2.5).float()
+    if max_depth is not None:
+        valid = valid * (gt_depth < max_depth).float()
     depth_loss = (F.l1_loss(pred_depth, gt_depth, reduction='none') * valid).sum() / valid.sum().clamp(min=1)
     intensity_loss = F.l1_loss(pred_intensity, gt_intensity)
     raydrop_loss = F.binary_cross_entropy_with_logits(pred_ray_drop_logits, gt_ray_drop)

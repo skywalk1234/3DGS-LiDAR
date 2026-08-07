@@ -21,7 +21,7 @@ from nuscenes.utils.data_classes import Box
 from nuscenes.utils.geometry_utils import view_points, transform_matrix
 from pyquaternion import Quaternion
 
-from dataset.data_util import img_loader, mask_loader_scene, align_dataset, stack_sample, build_lidar_range_image, LIDAR_NUM_RINGS, LIDAR_AZIMUTH_RESOLUTION
+from dataset.data_util import img_loader, mask_loader_scene, align_dataset, stack_sample, build_lidar_range_image, LIDAR_NUM_RINGS, LIDAR_AZIMUTH_BINS, LIDAR_AZIMUTH_RESOLUTION
 
 
 
@@ -44,8 +44,10 @@ class NuScenesdataset4D(Dataset):
                  num_target_timesteps: int = 4,
                  cache_dir="",
                  nuscenes_version="v1.0-trainval",
-                 context_span=6
-                 ):        
+                 context_span=6,
+                 with_sweeps: bool = False,
+                 num_sweeps_per_window: int = 2,
+                 ):
         super().__init__()
         self.version = nuscenes_version
         self.context_span = context_span
@@ -53,6 +55,11 @@ class NuScenesdataset4D(Dataset):
         self.cache_dir = cache_dir
         self.stage = stage
         self.dataset_idx = 0
+
+        # Sweep supervision config
+        self.with_sweeps = with_sweeps
+        self.num_sweeps_per_window = num_sweeps_per_window
+        self.sweep_h, self.sweep_w = 280, 518  # render resolution
 
         self.cameras = cameras
         self.num_cameras = len(cameras)
@@ -75,6 +82,20 @@ class NuScenesdataset4D(Dataset):
         self.mask_loader = mask_loader_scene
 
         self.dataset = NuScenes(version=self.version, dataroot=self.path, verbose=True)
+
+        # Precompute per-channel sweep sample_data index once (only when sweep
+        # supervision is enabled) so __getitem__ does not re-scan every record.
+        self._sweep_records_by_channel = {}
+        if self.with_sweeps:
+            for rec in self.dataset.sample_data:
+                if rec.get('is_key_frame'):
+                    continue
+                calib = self.dataset.get('calibrated_sensor', rec['calibrated_sensor_token'])
+                sensor = self.dataset.get('sensor', calib['sensor_token'])
+                channel = sensor['channel']
+                self._sweep_records_by_channel.setdefault(channel, []).append(rec)
+            for records in self._sweep_records_by_channel.values():
+                records.sort(key=lambda r: int(r['timestamp']))
 
         if stage == 'train':
             official_scene_names = splits.train  
@@ -519,6 +540,167 @@ class NuScenesdataset4D(Dataset):
         extrinsics = Quaternion(pose['rotation']).transformation_matrix
         extrinsics[:3, 3] = np.array(pose['translation'])
         return extrinsics.astype(np.float32)
+
+    # ------------------------------------------------------------------
+    # Sweep supervision helpers (intermediate-time camera + LiDAR GT)
+    # ------------------------------------------------------------------
+    def _sweeps_between(self, channel, start_ts, end_ts):
+        """Non-keyframe sample_data strictly between two keyframe timestamps."""
+        out = [
+            rec for rec in self._sweep_records_by_channel.get(channel, [])
+            if start_ts < int(rec['timestamp']) < end_ts
+        ]
+        out.sort(key=lambda r: int(r['timestamp']))
+        return out
+
+    def _sweep_cam_pose_ego0(self, sweep_rec, ego0_to_world):
+        """sensor -> ego0 (4x4). ego0_to_world must be the frame-0 keyframe ego
+        pose shared by camera & lidar (same frame as xyz_transformed)."""
+        calib = self.dataset.get('calibrated_sensor', sweep_rec['calibrated_sensor_token'])
+        sensor_to_ego = self.get_tranformation_mat(calib).astype(np.float64)
+        sweep_ego_to_world = self.get_ego_pose(sweep_rec)  # float64
+        return np.linalg.inv(ego0_to_world) @ sweep_ego_to_world @ sensor_to_ego
+
+    def _load_sweep_image(self, sweep_rec):
+        """Load original sweep image, resize to render resolution, [3,H,W] f32 /255."""
+        img = self.loader(os.path.join(self.path, sweep_rec['filename']))
+        img = img.resize((self.sweep_w, self.sweep_h), pil.LANCZOS)
+        return torch.from_numpy(np.asarray(img, dtype=np.float32)).permute(2, 0, 1) / 255.0
+
+    def _build_sweep_supervision(self, frame0_token, frameN_token):
+        """
+        Build intermediate-time sweep GT for the window [frame0, frameN].
+        Returns a dict of tensors (K sweeps x num_cams cameras + K lidar), or {} if
+        no sweep is available. All tensors live on CPU and are moved to GPU by PL.
+        """
+        K = self.num_sweeps_per_window
+        num_cams = self.num_cameras
+        sample0 = self.dataset.get('sample', frame0_token)
+        sampleN = self.dataset.get('sample', frameN_token)
+        if sample0 is None or sampleN is None:
+            return {}
+
+        # Frame-0 keyframe ego pose (all keyframe sensors share the same ego pose).
+        sd0_any = self.dataset.get('sample_data', sample0['data'][self.cameras[0]])
+        ego0_to_world = self.get_ego_pose(sd0_any)
+
+        fractions = np.linspace(0.3, 0.7, K)
+
+        # ===== Camera =====
+        camera_K = torch.zeros(K, num_cams, 3, 3)
+        camera_viewmat = torch.zeros(K, num_cams, 4, 4)
+        camera_gt = torch.zeros(K, num_cams, 3, self.sweep_h, self.sweep_w)
+        camera_t_seconds = torch.zeros(K, num_cams)
+        camera_span_seconds = torch.zeros(num_cams)
+        camera_valid = torch.zeros(K, num_cams, dtype=torch.bool)
+
+        for c, cam in enumerate(self.cameras):
+            sd0 = self.dataset.get('sample_data', sample0['data'][cam])
+            sdN = self.dataset.get('sample_data', sampleN['data'][cam])
+            kf0_ts = int(sd0['timestamp'])
+            kfN_ts = int(sdN['timestamp'])
+            if kfN_ts <= kf0_ts:
+                continue
+            span = (kfN_ts - kf0_ts) / 1e6
+            camera_span_seconds[c] = span
+
+            sweeps = self._sweeps_between(cam, kf0_ts, kfN_ts)
+            if not sweeps:
+                continue
+            for k in range(K):
+                target_ts = kf0_ts + fractions[k] * span * 1e6
+                best = min(sweeps, key=lambda r: abs(int(r['timestamp']) - target_ts))
+                best_ts = int(best['timestamp'])
+                camera_t_seconds[k, c] = (best_ts - kf0_ts) / 1e6
+
+                pose_ego0 = self._sweep_cam_pose_ego0(best, ego0_to_world)
+                camera_viewmat[k, c] = torch.from_numpy(np.linalg.inv(pose_ego0))
+
+                calib = self.dataset.get('calibrated_sensor', best['calibrated_sensor_token'])
+                intrinsic = np.asarray(calib['camera_intrinsic'], dtype=np.float64)
+                native_w = int(best['width'])
+                native_h = int(best['height'])
+                k_mat = np.eye(3, dtype=np.float64)
+                k_mat[0, 0] = intrinsic[0, 0] * (self.sweep_w / native_w)
+                k_mat[1, 1] = intrinsic[1, 1] * (self.sweep_h / native_h)
+                k_mat[0, 2] = intrinsic[0, 2] * (self.sweep_w / native_w)
+                k_mat[1, 2] = intrinsic[1, 2] * (self.sweep_h / native_h)
+                camera_K[k, c] = torch.from_numpy(k_mat)
+
+                camera_gt[k, c] = self._load_sweep_image(best)
+                camera_valid[k, c] = True
+
+        # ===== LiDAR =====
+        lidar_raster_pts = torch.zeros(K, 1, LIDAR_NUM_RINGS, LIDAR_AZIMUTH_BINS, 4)
+        lidar_viewmat = torch.zeros(K, 1, 4, 4)
+        lidar_el_boundaries = torch.zeros(K, LIDAR_NUM_RINGS // 8 + 1)
+        lidar_gt_depth = torch.zeros(K, 1, LIDAR_NUM_RINGS, LIDAR_AZIMUTH_BINS, 1)
+        lidar_gt_intensity = torch.zeros(K, 1, LIDAR_NUM_RINGS, LIDAR_AZIMUTH_BINS, 1)
+        lidar_gt_ray_drop = torch.zeros(K, 1, LIDAR_NUM_RINGS, LIDAR_AZIMUTH_BINS, 1)
+        lidar_t_seconds = torch.zeros(K)
+        lidar_span_seconds = torch.zeros(1)
+        lidar_valid = torch.zeros(K, dtype=torch.bool)
+
+        if 'LIDAR_TOP' in sample0.get('data', {}) and 'LIDAR_TOP' in sampleN.get('data', {}):
+            sd0_lidar = self.dataset.get('sample_data', sample0['data']['LIDAR_TOP'])
+            sdN_lidar = self.dataset.get('sample_data', sampleN['data']['LIDAR_TOP'])
+            kf0_ts = int(sd0_lidar['timestamp'])
+            kfN_ts = int(sdN_lidar['timestamp'])
+            if kfN_ts > kf0_ts:
+                span = (kfN_ts - kf0_ts) / 1e6
+                lidar_span_seconds[0] = span
+                sweeps = self._sweeps_between('LIDAR_TOP', kf0_ts, kfN_ts)
+                for k in range(K):
+                    if not sweeps:
+                        continue
+                    target_ts = kf0_ts + fractions[k] * span * 1e6
+                    best = min(sweeps, key=lambda r: abs(int(r['timestamp']) - target_ts))
+                    best_ts = int(best['timestamp'])
+                    lidar_t_seconds[k] = (best_ts - kf0_ts) / 1e6
+
+                    lidar_points = np.fromfile(
+                        os.path.join(self.path, best['filename']), dtype=np.float32
+                    ).reshape(-1, 5)
+                    calib = self.dataset.get('calibrated_sensor', best['calibrated_sensor_token'])
+                    calib_rot = Quaternion(calib['rotation']).rotation_matrix
+                    calib_trans = np.array(calib['translation']).reshape(1, 3)
+                    lidar_to_ego = np.eye(4)
+                    lidar_to_ego[:3, :3] = calib_rot
+                    lidar_to_ego[:3, 3] = calib_trans
+                    sweep_ego_to_world = self.get_ego_pose(best)  # float64
+                    lidar_to_ego0 = (np.linalg.inv(ego0_to_world) @ sweep_ego_to_world @ lidar_to_ego).astype(np.float32)
+                    lidar_viewmat[k, 0] = torch.from_numpy(np.linalg.inv(lidar_to_ego0))
+
+                    raster_pts, gt_depth, gt_intensity, gt_ray_drop, el_boundaries = build_lidar_range_image(
+                        lidar_points, lidar_to_ego, sweep_ego_to_world, best_ts
+                    )
+                    lidar_raster_pts[k, 0] = torch.from_numpy(raster_pts)
+                    lidar_el_boundaries[k] = torch.from_numpy(el_boundaries)
+                    lidar_gt_depth[k, 0] = torch.from_numpy(gt_depth)
+                    lidar_gt_intensity[k, 0] = torch.from_numpy(gt_intensity)
+                    lidar_gt_ray_drop[k, 0] = torch.from_numpy(gt_ray_drop)
+                    lidar_valid[k] = True
+
+        if not bool(camera_valid.any()) and not bool(lidar_valid.any()):
+            return {}
+
+        return {
+            'camera_K': camera_K.float(),
+            'camera_viewmat': camera_viewmat.float(),
+            'camera_gt': camera_gt.float(),
+            'camera_t_seconds': camera_t_seconds.float(),
+            'camera_span_seconds': camera_span_seconds.float(),
+            'camera_valid': camera_valid,
+            'lidar_raster_pts': lidar_raster_pts.float(),
+            'lidar_viewmat': lidar_viewmat.float(),
+            'lidar_el_boundaries': lidar_el_boundaries.float(),
+            'lidar_gt_depth': lidar_gt_depth.float(),
+            'lidar_gt_intensity': lidar_gt_intensity.float(),
+            'lidar_gt_ray_drop': lidar_gt_ray_drop.float(),
+            'lidar_t_seconds': lidar_t_seconds.float(),
+            'lidar_span_seconds': lidar_span_seconds.float(),
+            'lidar_valid': lidar_valid,
+        }
 
     def get_num_scenes(self):
         """Return the number of scenes"""
@@ -1077,12 +1259,22 @@ class NuScenesdataset4D(Dataset):
             except Exception as e:
                 print(f"Warning: Could not load lidar data: {e}")
 
+        # ---- Intermediate-time sweep supervision (train only) ----
+        sweeps = {}
+        if self.with_sweeps and self.stage == 'train' and source_frame_idx is not None:
+            try:
+                sweeps = self._build_sweep_supervision(frame_idx, source_frame_idx)
+            except Exception as e:
+                print(f"Warning: sweep supervision build failed: {e}")
+                sweeps = {}
+
         ret_sample = {
             'cur_sample': cur_sample,
             'context_frames': all_context_dict,
             'target_frames': target_dict,
             'all_dict': all_dict,
             'lidar': lidar_data,
+            'sweeps': sweeps,
         }
         return ret_sample
 
@@ -1106,6 +1298,9 @@ def custom_collate_fn(batch):
                 result[key] = values
         # Keep vehicle annotations as list to preserve batch dimension
         elif isinstance(key, str) and (key == 'vehicle_annotations' or key.startswith('vehicle_annotations_frame_')):
+            result[key] = values
+        # Sweeps stay a list[dict]; each dict's tensors are already K-shaped
+        elif isinstance(key, str) and key == 'sweeps':
             result[key] = values
         elif key in ['all_dict', 'context_frames']:
             result[key] = custom_collate_fn(values)

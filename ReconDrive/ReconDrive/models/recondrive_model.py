@@ -27,6 +27,7 @@ from kornia.losses import SSIMLoss
 from math import log2, log
 import sys
 from gsplat.rendering import rasterization, lidar_rasterization
+from dataset.data_util import LIDAR_NUM_RINGS, LIDAR_AZIMUTH_RESOLUTION
 import cv2
 from sam2.build_sam import build_sam2
 from sam2.sam2_image_predictor import SAM2ImagePredictor
@@ -866,6 +867,40 @@ class ReconDrive_LITModelModule(pl.LightningModule):
         self.all_render_frame_ids = selected_ids
          
 
+    def _lidar_raster_bid(self, recontrast_data, means_t, rot_all, bid,
+                          rp, vm, el_boundaries, n_el, az_res):
+        """Rasterize LiDAR range image for one batch item. Shared by the frame-0
+        render_lidar and the intermediate-time sweep lidar rendering."""
+        render, alpha, _, _ = lidar_rasterization(
+            means=means_t[bid],
+            quats=rot_all[bid],
+            scales=recontrast_data['scale_maps'][bid],
+            opacities=recontrast_data['opacity_maps'][bid].squeeze(-1),
+            lidar_features=recontrast_data['lidar_feat_maps'][bid].unsqueeze(0),  # [1, N, D]
+            velocities=None,
+            viewmats=vm,
+            raster_pts=rp,
+            tile_elevation_boundaries=el_boundaries,
+            n_elevation_channels=int(n_el),
+            azimuth_resolution=float(az_res),
+            near_plane=0.2,
+            far_plane=300,
+            compute_alpha_sum_until_points=False,
+        )
+
+        depth = render[..., -1:]
+        features = render[..., :-1]
+
+        rp_deg = torch.deg2rad(rp[..., :2])
+        ray_dir = torch.cat([
+            torch.cos(rp_deg[..., 0:1]) * torch.cos(rp_deg[..., 1:2]),
+            torch.sin(rp_deg[..., 0:1]) * torch.cos(rp_deg[..., 1:2]),
+            torch.sin(rp_deg[..., 1:2]),
+        ], dim=-1)
+
+        intensity, ray_drop_logits = self.lidar_decoder(features, ray_dir)
+        return depth, intensity, ray_drop_logits
+
     def render_lidar(self, recontrast_data, batch_input):
         lidar_data = batch_input.get('lidar')
         if not lidar_data or 'raster_pts' not in lidar_data or lidar_data['raster_pts'].numel() == 0:
@@ -911,34 +946,9 @@ class ReconDrive_LITModelModule(pl.LightningModule):
                 az_res = az_res[bid]
             az_res = az_res.item() if hasattr(az_res, 'item') else float(az_res)
 
-            render, alpha, _, _ = lidar_rasterization(
-                means=means_t[bid],
-                quats=rot_all[bid],
-                scales=recontrast_data['scale_maps'][bid],
-                opacities=recontrast_data['opacity_maps'][bid].squeeze(-1),
-                lidar_features=recontrast_data['lidar_feat_maps'][bid].unsqueeze(0),  # [1, N, D]
-                velocities=None,
-                viewmats=vm,
-                raster_pts=rp,
-                tile_elevation_boundaries=el_boundaries,
-                n_elevation_channels=int(n_el),
-                azimuth_resolution=float(az_res),
-                near_plane=0.2,
-                far_plane=300,
-                compute_alpha_sum_until_points=False,
+            depth, intensity, ray_drop_logits = self._lidar_raster_bid(
+                recontrast_data, means_t, rot_all, bid, rp, vm, el_boundaries, n_el, az_res
             )
-
-            depth = render[..., -1:]
-            features = render[..., :-1]
-
-            rp_deg = torch.deg2rad(rp[..., :2])
-            ray_dir = torch.cat([
-                torch.cos(rp_deg[..., 0:1]) * torch.cos(rp_deg[..., 1:2]),
-                torch.sin(rp_deg[..., 0:1]) * torch.cos(rp_deg[..., 1:2]),
-                torch.sin(rp_deg[..., 1:2]),
-            ], dim=-1)
-
-            intensity, ray_drop_logits = self.lidar_decoder(features, ray_dir)
 
             depth_list.append(depth)
             intensity_list.append(intensity)
@@ -949,6 +959,137 @@ class ReconDrive_LITModelModule(pl.LightningModule):
             "intensity": torch.stack(intensity_list).sigmoid(),
             "ray_drop_logits": torch.stack(raydrop_list),
         }
+
+    def move_gaussians_to_t(self, recontrast_data, t_seconds, span_seconds):
+        """Linear per-gaussian motion (vehicle flow) to an arbitrary time.
+        Mirrors render_splating_imgs / evaluate_sweeps.move_gaussians_to_t:
+        first half of the gaussians = frame-0 views, second half = frame-N views.
+        flow is in m/s, so t_seconds / span_seconds are real seconds."""
+        xyz = recontrast_data.get('xyz_transformed', recontrast_data['xyz'])
+        flow = recontrast_data['forward_flow']
+        t = float(np.clip(t_seconds, 0.0, float(span_seconds)))
+        xyz_t = xyz.clone()
+        mid_point = xyz_t.shape[1] // 2
+        xyz_t[:, :mid_point] += flow[:, :mid_point] * t
+        xyz_t[:, mid_point:] -= flow[:, mid_point:] * (float(span_seconds) - t)
+        return xyz_t
+
+    def _render_sweep_camera_view(self, recontrast_data, xyz_t, bid, viewmat, Kmat):
+        """Render the (already time-moved) gaussians from one sweep camera pose."""
+        if self.translate_3dgs and 'rot_maps_transformed' in recontrast_data:
+            rot = recontrast_data['rot_maps_transformed']
+            sh = recontrast_data['sh_maps_transformed']
+        else:
+            rot = recontrast_data['rot_maps']
+            sh = recontrast_data['sh_maps']
+        colors, alphas, _ = rasterization(
+            xyz_t[bid],
+            rot[bid],
+            recontrast_data['scale_maps'][bid],
+            recontrast_data['opacity_maps'][bid].squeeze(-1),
+            sh[bid],
+            velocities=None,
+            viewmats=viewmat.unsqueeze(0),
+            Ks=Kmat.unsqueeze(0),
+            width=self.render_width,
+            height=self.render_height,
+            sh_degree=self.sh_degree,
+            render_mode="RGB",
+        )
+        rgb = colors[..., :3].permute(0, 3, 1, 2).clamp(0, 1)  # [1, 3, H, W]
+        return rgb[0], alphas[0].unsqueeze(0).unsqueeze(0)  # [3,H,W], [1,1,H,W]
+
+    def compute_sweep_loss(self, recontrast_data, batch_input):
+        """Intermediate-time sweep supervision: camera photometric loss + LiDAR
+        depth/intensity/raydrop loss. Returns the summed scalar loss (0 if none)."""
+        sweeps_list = batch_input.get('sweeps') or []
+        loss_cam = torch.tensor(0.0, device=self.device)
+        loss_lid = torch.tensor(0.0, device=self.device)
+        n_cam = 0
+        n_lid = 0
+
+        use_cam = getattr(self, 'use_sweep_camera_loss', True)
+        use_lid = getattr(self, 'use_sweep_lidar_loss', True)
+
+        # Rotation attributes follow the position coordinate frame (like render_lidar)
+        if self.translate_3dgs and 'rot_maps_transformed' in recontrast_data:
+            rot_all = recontrast_data['rot_maps_transformed']
+        else:
+            rot_all = recontrast_data['rot_maps']
+
+        for bid, sw in enumerate(sweeps_list):
+            if not sw:
+                continue
+
+            # ---- camera sweep loss ----
+            if use_cam and 'camera_gt' in sw:
+                Ks = sw['camera_K']
+                VMs = sw['camera_viewmat']
+                gts = sw['camera_gt']
+                valid = sw['camera_valid']
+                t_cam = sw['camera_t_seconds']
+                span_cam = sw['camera_span_seconds']
+                for k in range(Ks.shape[0]):
+                    for c in range(Ks.shape[1]):
+                        if not valid[k, c]:
+                            continue
+                        xyz_t = self.move_gaussians_to_t(
+                            recontrast_data, t_cam[k, c].item(), span_cam[c].item()
+                        )
+                        pred, alpha = self._render_sweep_camera_view(
+                            recontrast_data, xyz_t, bid, VMs[k, c], Ks[k, c]
+                        )
+                        mask = (alpha > getattr(self, 'sweep_alpha_thresh', 0.05)).float()
+                        if mask.sum() < 10:  # empty view, skip
+                            del xyz_t, pred, alpha, mask
+                            continue
+                        rep = compute_photometric_loss(pred[None], gts[k, c][None])
+                        loss_cam = loss_cam + compute_masked_loss(rep, mask, eps=0.1)
+                        n_cam += 1
+                        del xyz_t, pred, alpha, mask, rep
+
+            # ---- lidar sweep loss ----
+            if use_lid and 'lidar_gt_depth' in sw:
+                span_lid = sw['lidar_span_seconds'][0].item()
+                for k in range(sw['lidar_gt_depth'].shape[0]):
+                    if not sw['lidar_valid'][k]:
+                        continue
+                    xyz_t = self.move_gaussians_to_t(
+                        recontrast_data, sw['lidar_t_seconds'][k].item(), span_lid
+                    )
+                    rp = sw['lidar_raster_pts'][k, 0]
+                    vm = sw['lidar_viewmat'][k]
+                    el_boundaries = sw['lidar_el_boundaries'][k]
+                    depth, intensity, ray_drop_logits = self._lidar_raster_bid(
+                        recontrast_data, xyz_t, rot_all, bid,
+                        rp, vm, el_boundaries,
+                        LIDAR_NUM_RINGS, LIDAR_AZIMUTH_RESOLUTION,
+                    )
+                    loss_lid = loss_lid + compute_lidar_loss(
+                        pred_depth=depth[0],
+                        gt_depth=sw['lidar_gt_depth'][k, 0],
+                        pred_intensity=intensity[0].sigmoid(),
+                        gt_intensity=sw['lidar_gt_intensity'][k, 0],
+                        pred_ray_drop_logits=ray_drop_logits[0],
+                        gt_ray_drop=sw['lidar_gt_ray_drop'][k, 0],
+                        lambda_depth=getattr(self, 'lambda_lidar_depth', 1.0),
+                        lambda_intensity=getattr(self, 'lambda_lidar_intensity', 0.1),
+                        lambda_raydrop=getattr(self, 'lambda_lidar_raydrop', 0.01),
+                        max_depth=getattr(self, 'sweep_lidar_max_depth', 80.0),
+                    )
+                    n_lid += 1
+                    del xyz_t, rp, vm, el_boundaries, depth, intensity, ray_drop_logits
+
+        if n_cam > 0:
+            loss_cam = getattr(self, 'lambda_sweep_camera', 1.0) * loss_cam / n_cam
+            self.log('train/sweep_cam', loss_cam.item(),
+                     on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
+        if n_lid > 0:
+            loss_lid = getattr(self, 'lambda_sweep_lidar', 1.0) * loss_lid / n_lid
+            self.log('train/sweep_lidar', loss_lid.item(),
+                     on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
+
+        return loss_cam + loss_lid
 
     def training_step(self, batch_input, batch_idx):
         self.stage = stage = 'train'
@@ -1021,13 +1162,19 @@ class ReconDrive_LITModelModule(pl.LightningModule):
         if 'lidar' in batch_input:
             del batch_input['lidar']
 
+        # ===== 中间时刻 sweep 监督损失 (train only, 默认关闭) =====
+        loss_sweeps = torch.tensor(0.0, device=self.device)
+        if getattr(self, 'use_sweep_supervision', False) and batch_input.get('sweeps'):
+            loss_sweeps = self.compute_sweep_loss(batch_recontrast_data, batch_input)
+        # ===== 结束 =====
+
         self.log(f'{stage}/gs', loss_gaussian.item(), on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
         self.log(f'{stage}/proj', loss_project.item(), on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
         self.log(f'{stage}/norm', loss_norm.item(), on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
         if loss_lidar.item() > 0:
             self.log(f'{stage}/lidar', loss_lidar.item(), on_step=True, on_epoch=True, prog_bar=False, sync_dist=True)
 
-        loss_all = loss_gaussian + loss_depth + loss_project + loss_norm + loss_lidar + loss_depth_direct
+        loss_all = loss_gaussian + loss_depth + loss_project + loss_norm + loss_lidar + loss_depth_direct + loss_sweeps
         psnr, ssim, lpips = self.compute_reconstruction_metrics(batch_splating_data,stage)
 
         del batch_input, batch_recontrast_data, batch_render_data, batch_render_project_data, batch_splating_data, psnr, ssim, lpips
