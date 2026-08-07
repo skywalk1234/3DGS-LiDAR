@@ -123,6 +123,15 @@ class VGGT4DGS_LITDataModule(pl.LightningDataModule):
         else:
             jittering_prob = 0.0
 
+        # Sweep supervision is train-only. When enabled, random crop must be
+        # disabled: sweep GT is the full-frame resize, while a cropped keyframe
+        # would shift the field-of-view semantics between the two losses.
+        with_sweeps = getattr(self, 'with_sweeps', False) and mode == 'train'
+        if with_sweeps and crop_scale:
+            crop_scale = []
+            crop_ratio = []
+            crop_prob = 0.0
+
         dataset_args = {
             'cameras': self.cameras,
             'back_context': self.back_context,
@@ -140,7 +149,9 @@ class VGGT4DGS_LITDataModule(pl.LightningDataModule):
             'with_mask': 'mask' in self.train_requirements,
             'cache_dir': self.cache_dir,
             'nuscenes_version': getattr(self, 'nuscenes_version', 'v1.0-trainval'),
-            'context_span': getattr(self, 'context_span', 6)
+            'context_span': getattr(self, 'context_span', 6),
+            'with_sweeps': with_sweeps,
+            'num_sweeps_per_window': getattr(self, 'num_sweeps_per_window', 2),
         }
         stage_dict = {
             'train':'train',
