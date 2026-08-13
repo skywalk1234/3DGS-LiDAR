@@ -57,7 +57,7 @@ model_cfg:
   # When on: input stays samples/keyframes, but the model also renders and
   # supervises the raw camera + LIDAR_TOP sweeps strictly between the two
   # keyframes, matching the evaluate_sweeps.py inference-time distribution.
-  use_sweep_supervision: false
+  use_sweep_supervision: true   # mini 训练启用：渲染中间时刻 sweep，和 sweep 真值算相机+雷达损失
   use_sweep_camera_loss: true
   use_sweep_lidar_loss: true
   lambda_sweep_camera: 1.0
@@ -91,7 +91,7 @@ data_cfg:
   nuscenes_version: 'v1.0-mini'
   context_span: 1  # Reduced for 2Hz data (mini only has 2Hz keyframes)
   # Intermediate sweep supervision (train-only): build GT for K sweeps per window
-  with_sweeps: false
+  with_sweeps: true             # 训练时构建中间时刻 sweep GT（相机 + LIDAR_TOP）
   num_sweeps_per_window: 2
   cameras: ['CAM_FRONT', 'CAM_FRONT_LEFT', 'CAM_FRONT_RIGHT', 'CAM_BACK_LEFT', 'CAM_BACK_RIGHT', 'CAM_BACK']
   # gt_ego_pose, gt_depth is not used during training, only for visulization
