@@ -1008,7 +1008,9 @@ class ReconDrive_LITModelModule(pl.LightningModule):
             render_mode="RGB",
         )
         rgb = colors[..., :3].permute(0, 3, 1, 2).clamp(0, 1)  # [1, 3, H, W]
-        return rgb[0], alphas[0].unsqueeze(0).unsqueeze(0)  # [3,H,W], [1,1,H,W]
+        # alphas 形状是 [C, H, W, 1]，先去掉末尾通道维再补 batch/channel 维，
+        # 得到 [1, 1, H, W]（和 compute_photometric_loss 的 rep 一致，避免广播错位）
+        return rgb[0], alphas[0, ..., 0].unsqueeze(0).unsqueeze(0)  # [3,H,W], [1,1,H,W]
 
     def compute_sweep_loss(self, recontrast_data, batch_input):
         """Intermediate-time sweep supervision: camera photometric loss + LiDAR
