@@ -1,0 +1,129 @@
+
+# =====================================================================
+# ReconDrive 全量 12Hz 训练配置 (nuScenes interp_12Hz_trainval)
+#
+# 基于 configs/nuscenes/recondrive.yaml (mini) 修改，用于全量 12Hz 数据集。
+# 与 mini 配置的差异：
+#   - data_cfg.nuscenes_version : v1.0-mini  -> interp_12Hz_trainval
+#   - data_cfg.context_span     : 1          -> 6
+#   - model_cfg.frame_rate      : 2          -> 12
+#   - data_path / cache_dir     : ★ 必改，改成学长服务器上的全量数据路径
+#
+# 说明：
+#   - 训练时模型会从 batch 实际形状反推 context_span（PL 启动时会先跑 2 个
+#     val batch 的 sanity check，把 context_span 设为 6），所以这里不需要在
+#     model_cfg 里再写 context_span。
+#   - frame_rate=12 与 context_span=6 配套：窗口时长 = 6 × (1/12) = 0.5s，
+#     车辆 flow 线性插值就用这个时长。
+#   - 12Hz 下模型固定渲染并监督 frame 0 + 中间 5 帧（[0,1,2,3,4,5]），
+#     由 models/recondrive_model.py 的 prob_sample_rendered_ids 实现，
+#     仅 context_span>1 时生效。
+
+# =====================================================================
+
+save_dir: './work_dirs/recondrive_training_12hz'
+seed: 1
+train_epoch: 120
+devices: [0,1,2,3,4,5,6,7]
+
+
+model_cfg:
+  height: 280
+  width: 518
+  render_width_min: 259
+  render_width_max: 768
+  num_cams: 6
+  embed_dim: 1024
+  # freeze_patterns: ['aggregator','lpips']
+  auto_scale_lr: True
+  learning_rate: 0.00001
+  # momentum: 0.9
+  weight_decay: 0.01
+  # scheduler_step_size: 15
+  # scheduler_gamma: 0.1
+  lr_restart_epoch: 5
+  lr_restart_mult: 2
+  lr_min_factor: 0.1
+  backbone_lr_scale: 0.3  # Backbone LR = learning_rate * backbone_lr_scale (only applies when unfreeze_last_n_blocks > 0)
+  residual_lr: 0.0003  # Residual heads LR (depth_residual_head / lidar_feat_residual_head), higher than base LR
+
+  frame_ids: [0, 1, 2, 3, 4, 5, 6]
+
+  frame_rate: 12  # Dataset frame rate (Hz): 2 for mini, 12 for full
+
+  use_vehicle_flow: true
+
+  depth_conf_thr: 0.99
+  min_depth: 1.5
+  max_depth: 110
+  focal_length_scale: 300
+  sh_degree: 4
+
+  save_image_duration: 100
+
+  lambda_project: 1.0
+  lambda_edge: 0.1
+  lambda_depth: 0.001
+  lambda_gaussian: 2
+  lambda_scale: 0.01
+  lambda_opacity: 0.01
+
+  # LiDAR loss weights
+  lambda_lidar_depth: 1.0
+  lambda_lidar_intensity: 0.1
+  lambda_lidar_raydrop: 0.01
+  lambda_depth_direct: 1.0     # Direct sparse depth L1 loss weight
+  lidar_feat_dim: 16
+
+  # Intermediate-time sweep supervision (train-only, off by default).
+  # 12Hz 下保持关闭：中间关键帧本身就是监督目标，不需要再用 raw sweep 监督。
+  use_sweep_supervision: false
+  use_sweep_camera_loss: true
+  use_sweep_lidar_loss: true
+  lambda_sweep_camera: 1.0
+  lambda_sweep_lidar: 1.0
+  sweep_alpha_thresh: 0.05     # camera sweep mask: pixels with rasterized alpha > this
+  sweep_lidar_max_depth: 80.0  # only supervise lidar depth < 80m (aligns with evaluate_sweeps)
+
+  # Model checkpoint paths
+  vggt_checkpoint: 'checkpoints/vggt.pt'
+  sam2_checkpoint: 'checkpoints/sam2.1_hiera_small.pt'  # Relative to SAM2 installation directory
+  sam2_model_cfg: 'configs/sam2.1/sam2.1_hiera_s.yaml'
+  sam2_dir: null  # Set to SAM2 installation directory, or leave null to auto-detect
+
+  # VGGT backbone fine-tuning configuration
+  # Number of last frame+global blocks to fully unfreeze (not just LoRA).
+  # Aggregator has 24 frame_blocks + 24 global_blocks (48 total).
+  # Set to 0 to keep all blocks LoRA-only (current default).
+  # Recommended: 2-6 for partial fine-tuning.
+  unfreeze_last_n_blocks: 0
+
+
+data_cfg:
+  # ★★★ 必改：全量 nuScenes 数据根目录（包含 interp_12Hz_trainval/、samples/、sweeps/）
+  data_path: '/path/to/nuscenes'
+  # ★★★ 必改：缓存目录（深度图缓存实际写到 <cache_dir 的父目录>/samples/DEPTH_MAP/，
+  #          需要大磁盘，预计 50-100GB）
+  cache_dir: '/path/to/cache/nuscenes-12hz'
+  height: 280
+  width: 518
+  back_context: 0
+  forward_context: 0
+  depth_type: 'lidar'
+  # 全量 12Hz 插值版本：目录必须真实存在且包含全部 nuScenes 表
+  #（scene/sample/sample_data/ego_pose/calibrated_sensor/... json）
+  nuscenes_version: 'interp_12Hz_trainval'
+  context_span: 6  # 12Hz 下窗口 = frame 0 + 6 帧后 = 0.5s 间隔
+  # Intermediate sweep supervision (train-only): build GT for K sweeps per window
+  with_sweeps: false
+  num_sweeps_per_window: 2
+  cameras: ['CAM_FRONT', 'CAM_FRONT_LEFT', 'CAM_FRONT_RIGHT', 'CAM_BACK_LEFT', 'CAM_BACK_RIGHT', 'CAM_BACK']
+  # gt_ego_pose, gt_depth is not used during training, only for visulization
+  train_requirements: (gt_pose, gt_ego_pose, gt_depth, mask)
+  val_requirements: (gt_pose, gt_ego_pose, gt_depth, mask)
+
+  batch_size: 1
+  data_shuffle: True
+  drop_last: False
+  num_workers: 8
+  num_epochs: 10

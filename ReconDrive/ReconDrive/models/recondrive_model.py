@@ -826,6 +826,17 @@ class ReconDrive_LITModelModule(pl.LightningModule):
         outputs = {}
 
     def prob_sample_rendered_ids(self):
+        # 12Hz 全量数据（interp_12Hz_trainval，context_span > 1）：
+        # 确定性地渲染并监督 frame 0 + 全部中间帧（1..context_span-1），不做随机采样。
+        # mini（context_span=1）保持原有随机逻辑不变。
+        if getattr(self, 'context_span', 1) > 1:
+            self.all_render_frame_ids = list(range(0, self.context_span))
+            if hasattr(self, 'global_rank') and self.global_rank is not None:
+                print(f"[GPU {self.global_rank}] 12Hz fixed rendered ids: {self.all_render_frame_ids}")
+            else:
+                print(f"12Hz fixed rendered ids: {self.all_render_frame_ids}")
+            return
+
         num_frames = self.context_span + 1
         prob_all_render_frame_ids = [0.7] + [0.3] * (num_frames - 2) + [0.2, 0.0] if num_frames >= 2 else [1.0]
         prob_all_render_frame_ids = prob_all_render_frame_ids[:num_frames] if num_frames <= 7 else prob_all_render_frame_ids + [0.0] * (num_frames - 7)
