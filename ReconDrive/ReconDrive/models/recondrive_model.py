@@ -1070,7 +1070,9 @@ class ReconDrive_LITModelModule(pl.LightningModule):
                     xyz_t = self.move_gaussians_to_t(
                         recontrast_data, sw['lidar_t_seconds'][k].item(), span_lid
                     )
-                    rp = sw['lidar_raster_pts'][k, 0]
+                    # raster_pts 保留 C=1 维（[1, 32, 3600, 4]），和 viewmat [1, 4, 4] 对齐；
+                    # 用 [k, 0] 会把 C 维丢掉，触发 lidar_rasterization 的 shape assert
+                    rp = sw['lidar_raster_pts'][k]
                     vm = sw['lidar_viewmat'][k]
                     el_boundaries = sw['lidar_el_boundaries'][k]
                     depth, intensity, ray_drop_logits = self._lidar_raster_bid(
