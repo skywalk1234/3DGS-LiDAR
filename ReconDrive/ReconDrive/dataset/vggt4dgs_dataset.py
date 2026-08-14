@@ -593,6 +593,7 @@ class NuScenesdataset4D(Dataset):
         # K_cam 取所有相机的最大 sweep 数；不足的通道用 camera_valid=False 补齐。
         cam_kf_ts = {}
         cam_sweep_lists = {}
+        camera_span_seconds = torch.zeros(num_cams)
         for c, cam in enumerate(self.cameras):
             sd0 = self.dataset.get('sample_data', sample0['data'][cam])
             sdN = self.dataset.get('sample_data', sampleN['data'][cam])
@@ -611,7 +612,6 @@ class NuScenesdataset4D(Dataset):
         camera_viewmat = torch.zeros(K_cam, num_cams, 4, 4)
         camera_gt = torch.zeros(K_cam, num_cams, 3, self.sweep_h, self.sweep_w)
         camera_t_seconds = torch.zeros(K_cam, num_cams)
-        camera_span_seconds = torch.zeros(num_cams)
         camera_valid = torch.zeros(K_cam, num_cams, dtype=torch.bool)
 
         for c, cam in enumerate(self.cameras):
