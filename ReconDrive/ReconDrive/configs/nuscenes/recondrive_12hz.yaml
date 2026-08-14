@@ -7,15 +7,16 @@
 #   - data_cfg.nuscenes_version : v1.0-mini  -> interp_12Hz_trainval
 #   - data_cfg.context_span     : 1          -> 6
 #   - model_cfg.frame_rate      : 2          -> 12
-#   - data_path / cache_dir     : ★ 必改，改成学长服务器上的全量数据路径
+#   - data_path / cache_dir     : ★ 必改，改成服务器上的全量数据路径
 #
 # 说明：
-#   - 训练时模型会从 batch 实际形状反推 context_span（PL 启动时会先跑 2 个
-#     val batch 的 sanity check，把 context_span 设为 6），所以这里不需要在
-#     model_cfg 里再写 context_span。
+#   - context_span 由 scripts/trainer.py 从 data_cfg 显式传入 model_cfg
+#     （trainer.py: if 'context_span' in data_cfg: model_cfg['context_span']=...），
+#     不再依赖 sanity val 副作用，所以这里不需要在 model_cfg 里再写 context_span。
 #   - frame_rate=12 与 context_span=6 配套：窗口时长 = 6 × (1/12) = 0.5s，
 #     车辆 flow 线性插值就用这个时长。
-#   - 12Hz 下模型固定渲染并监督 frame 0 + 中间 5 帧（[0,1,2,3,4,5]），
+#   - 12Hz 下模型固定渲染并监督 frame 0 + 中间 5 帧 + 第二个 context 帧
+#     （[0,1,2,3,4,5,6]，含 frame 6 让 frameN-half 原生位姿也有直接监督），
 #     由 models/recondrive_model.py 的 prob_sample_rendered_ids 实现，
 #     仅 context_span>1 时生效。
 

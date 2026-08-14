@@ -1264,6 +1264,22 @@ class NuScenesdataset4D(Dataset):
                                 lidar_data['projected_depth_fn'] = torch.from_numpy(proj_depth_fn).float()
                                 lidar_data['projected_intensity_fn'] = torch.from_numpy(proj_intensity_fn).float()
                                 lidar_data['projected_mask_fn'] = torch.from_numpy(proj_mask_fn).float()
+
+                                # ---- Frame N 雷达范围图 GT（与 frame 0 对称：让 frameN-half 高斯
+                                #      在 tN 原生位姿也有直接雷达范围图监督） ----
+                                ctx_ego_to_world = self.get_ego_pose(ctx_lidar_sd)  # frame N 的 ego_to_world
+                                ctx_raster_pts, ctx_gt_depth, ctx_gt_intensity, ctx_gt_ray_drop, ctx_el_boundaries = build_lidar_range_image(
+                                    ctx_lidar_pts, ctx_lidar_to_ego, ctx_ego_to_world, ctx_lidar_sd['timestamp']
+                                )
+                                # viewmat_fn = ego_0 → lidar_N：把 ego_0 系高斯渲染到 frame N 时刻的 lidar 球面。
+                                # 与 _build_sweep_supervision 的 lidar 段一致：inv(inv(ego0_to_world) @ egoN_to_world @ lidar_to_ego)
+                                lidar_to_ego0 = np.linalg.inv(ego_to_world) @ ctx_ego_to_world @ ctx_lidar_to_ego
+                                lidar_data['raster_pts_fn'] = torch.from_numpy(ctx_raster_pts).float()
+                                lidar_data['viewmat_fn'] = torch.from_numpy(np.linalg.inv(lidar_to_ego0)).float()[None]
+                                lidar_data['tile_elevation_boundaries_fn'] = torch.from_numpy(ctx_el_boundaries).float()
+                                lidar_data['gt_depth_fn'] = torch.from_numpy(ctx_gt_depth).float()
+                                lidar_data['gt_intensity_fn'] = torch.from_numpy(ctx_gt_intensity).float()
+                                lidar_data['gt_ray_drop_fn'] = torch.from_numpy(ctx_gt_ray_drop).float()
                     except Exception as e:
                         print(f"Warning: Could not load/project context frame LiDAR: {e}")
             except Exception as e:

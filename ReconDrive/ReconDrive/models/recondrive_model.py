@@ -889,20 +889,29 @@ class ReconDrive_LITModelModule(pl.LightningModule):
 
         B = recontrast_data['xyz'].shape[0]
 
-        # 运动补偿：把参与雷达渲染的高斯统一到 "t0 时刻的 ego_0 坐标系"
-        # GT 雷达是 frame 0 时刻的观测，因此:
+        # 运动补偿：把参与雷达渲染的高斯统一到目标时刻的 ego_0 坐标系
         # 1) 用 xyz_transformed 把 frame N 的高斯从 ego_N 对齐到 ego_0（自车运动）
-        # 2) 用 vehicle flow 把动态物体从 tN 位置补偿回 t0 位置（与渲染 frame 0 相机图一致）
+        # 2) 用 vehicle flow 把动态物体补偿到目标时刻
         if 'xyz_transformed' in recontrast_data:
             means_all = recontrast_data['xyz_transformed']
         else:
             means_all = recontrast_data['xyz']
         mid_point = means_all.shape[1] // 2
-        means_t = means_all.clone()
-        if self.use_vehicle_flow and 'forward_flow' in recontrast_data:
-            context_span_delta = self.context_span * self.frame_step_s
-            # frame 0 的高斯保持 t0 位置；frame N 的高斯减去 flow * 总时长，补偿回 t0
-            means_t[:, mid_point:] -= recontrast_data['forward_flow'][:, mid_point:] * context_span_delta
+        flow = recontrast_data.get('forward_flow', None)
+        context_span_delta = self.context_span * self.frame_step_s
+
+        # frame 0 渲染：frame N-half 减去 flow * 总时长，补偿回 t0
+        means_t0 = means_all.clone()
+        if self.use_vehicle_flow and flow is not None:
+            means_t0[:, mid_point:] -= flow[:, mid_point:] * context_span_delta
+
+        # frame N 渲染（若 frame N 雷达 GT 存在）：frame 0-half 补偿到 tN，frame N-half 保持原生
+        has_frameN = 'raster_pts_fn' in lidar_data and lidar_data['raster_pts_fn'].numel() > 0
+        means_tN = None
+        if has_frameN:
+            means_tN = means_all.clone()
+            if self.use_vehicle_flow and flow is not None:
+                means_tN[:, :mid_point] += flow[:, :mid_point] * context_span_delta
 
         # 旋转属性与位置坐标系保持一致（translate_3dgs 时 rot 也已旋转到 ego_0）
         if self.translate_3dgs and 'rot_maps_transformed' in recontrast_data:
@@ -910,36 +919,79 @@ class ReconDrive_LITModelModule(pl.LightningModule):
         else:
             rot_all = recontrast_data['rot_maps']
 
-        depth_list, intensity_list, raydrop_list = [], [], []
+        def _render_all(means_t, rp_key, vm_key, el_key):
+            depth_list, intensity_list, raydrop_list = [], [], []
+            for bid in range(B):
+                rp = lidar_data[rp_key][bid]
+                vm = lidar_data[vm_key][bid]
+                el_boundaries = lidar_data[el_key]
+                if el_boundaries.dim() > 1:
+                    el_boundaries = el_boundaries[bid]
+                n_el_val = lidar_data['n_elevation_channels']
+                if n_el_val.dim() > 0:
+                    n_el_val = n_el_val[bid]
+                n_el = n_el_val.item() if hasattr(n_el_val, 'item') else int(n_el_val)
+                az_res = lidar_data['azimuth_resolution']
+                if az_res.dim() > 0:
+                    az_res = az_res[bid]
+                az_res = az_res.item() if hasattr(az_res, 'item') else float(az_res)
 
-        for bid in range(B):
-            rp = lidar_data['raster_pts'][bid]
-            vm = lidar_data['viewmat'][bid]
-            el_boundaries = lidar_data['tile_elevation_boundaries']
-            if el_boundaries.dim() > 1:
-                el_boundaries = el_boundaries[bid]
-            n_el_val = lidar_data['n_elevation_channels']
-            if n_el_val.dim() > 0:
-                n_el_val = n_el_val[bid]
-            n_el = n_el_val.item() if hasattr(n_el_val, 'item') else int(n_el_val)
-            az_res = lidar_data['azimuth_resolution']
-            if az_res.dim() > 0:
-                az_res = az_res[bid]
-            az_res = az_res.item() if hasattr(az_res, 'item') else float(az_res)
-
-            depth, intensity, ray_drop_logits = self._lidar_raster_bid(
-                recontrast_data, means_t, rot_all, bid, rp, vm, el_boundaries, n_el, az_res
+                depth, intensity, ray_drop_logits = self._lidar_raster_bid(
+                    recontrast_data, means_t, rot_all, bid, rp, vm, el_boundaries, n_el, az_res
+                )
+                depth_list.append(depth)
+                intensity_list.append(intensity)
+                raydrop_list.append(ray_drop_logits)
+            return (
+                torch.stack(depth_list),
+                torch.stack(intensity_list).sigmoid(),
+                torch.stack(raydrop_list),
             )
 
-            depth_list.append(depth)
-            intensity_list.append(intensity)
-            raydrop_list.append(ray_drop_logits)
-
-        return {
-            "depth": torch.stack(depth_list),
-            "intensity": torch.stack(intensity_list).sigmoid(),
-            "ray_drop_logits": torch.stack(raydrop_list),
+        depth, intensity, raydrop = _render_all(
+            means_t0, 'raster_pts', 'viewmat', 'tile_elevation_boundaries'
+        )
+        out = {
+            "depth": depth,
+            "intensity": intensity,
+            "ray_drop_logits": raydrop,
         }
+        if has_frameN:
+            depth_fn, intensity_fn, raydrop_fn = _render_all(
+                means_tN, 'raster_pts_fn', 'viewmat_fn', 'tile_elevation_boundaries_fn'
+            )
+            out["depth_fn"] = depth_fn
+            out["intensity_fn"] = intensity_fn
+            out["ray_drop_logits_fn"] = raydrop_fn
+        return out
+
+    def _compute_lidar_loss(self, lidar_out, gt):
+        """Frame 0 + frame N 雷达范围图损失之和；frame N GT 不存在时只算 frame 0。"""
+        loss = compute_lidar_loss(
+            pred_depth=lidar_out['depth'],
+            gt_depth=gt['gt_depth'],
+            pred_intensity=lidar_out['intensity'],
+            gt_intensity=gt['gt_intensity'],
+            pred_ray_drop_logits=lidar_out['ray_drop_logits'],
+            gt_ray_drop=gt['gt_ray_drop'],
+            lambda_depth=getattr(self, 'lambda_lidar_depth', 1.0),
+            lambda_intensity=getattr(self, 'lambda_lidar_intensity', 0.1),
+            lambda_raydrop=getattr(self, 'lambda_lidar_raydrop', 0.01),
+        )
+        if 'depth_fn' in lidar_out and 'gt_depth_fn' in gt:
+            loss_fn = compute_lidar_loss(
+                pred_depth=lidar_out['depth_fn'],
+                gt_depth=gt['gt_depth_fn'],
+                pred_intensity=lidar_out['intensity_fn'],
+                gt_intensity=gt['gt_intensity_fn'],
+                pred_ray_drop_logits=lidar_out['ray_drop_logits_fn'],
+                gt_ray_drop=gt['gt_ray_drop_fn'],
+                lambda_depth=getattr(self, 'lambda_lidar_depth', 1.0),
+                lambda_intensity=getattr(self, 'lambda_lidar_intensity', 0.1),
+                lambda_raydrop=getattr(self, 'lambda_lidar_raydrop', 0.01),
+            )
+            loss = loss + loss_fn
+        return loss
 
     def move_gaussians_to_t(self, recontrast_data, t_seconds, span_seconds):
         """Linear per-gaussian motion (vehicle flow) to an arbitrary time.
@@ -1129,17 +1181,7 @@ class ReconDrive_LITModelModule(pl.LightningModule):
         lidar_out = self.render_lidar(batch_recontrast_data, batch_input)
         if lidar_out is not None and 'lidar' in batch_input:
             gt = batch_input['lidar']
-            loss_lidar = compute_lidar_loss(
-                pred_depth=lidar_out['depth'],
-                gt_depth=gt['gt_depth'],
-                pred_intensity=lidar_out['intensity'],
-                gt_intensity=gt['gt_intensity'],
-                pred_ray_drop_logits=lidar_out['ray_drop_logits'],
-                gt_ray_drop=gt['gt_ray_drop'],
-                lambda_depth=getattr(self, 'lambda_lidar_depth', 1.0),
-                lambda_intensity=getattr(self, 'lambda_lidar_intensity', 0.1),
-                lambda_raydrop=getattr(self, 'lambda_lidar_raydrop', 0.01),
-            )
+            loss_lidar = self._compute_lidar_loss(lidar_out, gt)
 
         # Clean up lidar memory to avoid OOM accumulation
         if lidar_out is not None:
@@ -1260,11 +1302,7 @@ class ReconDrive_LITModelModule(pl.LightningModule):
         lidar_out = self.render_lidar(batch_recontrast_data, batch_input)
         if lidar_out is not None and 'lidar' in batch_input:
             gt = batch_input['lidar']
-            loss_lidar = compute_lidar_loss(
-                pred_depth=lidar_out['depth'], gt_depth=gt['gt_depth'],
-                pred_intensity=lidar_out['intensity'], gt_intensity=gt['gt_intensity'],
-                pred_ray_drop_logits=lidar_out['ray_drop_logits'], gt_ray_drop=gt['gt_ray_drop'],
-            )
+            loss_lidar = self._compute_lidar_loss(lidar_out, gt)
 
         self.log(f'{stage}/gs', loss_gaussian.item(), on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
         self.log(f'{stage}/proj', loss_project.item(), on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
@@ -1305,11 +1343,7 @@ class ReconDrive_LITModelModule(pl.LightningModule):
         lidar_out = self.render_lidar(batch_recontrast_data, batch_input)
         if lidar_out is not None and 'lidar' in batch_input:
             gt = batch_input['lidar']
-            loss_lidar = compute_lidar_loss(
-                pred_depth=lidar_out['depth'], gt_depth=gt['gt_depth'],
-                pred_intensity=lidar_out['intensity'], gt_intensity=gt['gt_intensity'],
-                pred_ray_drop_logits=lidar_out['ray_drop_logits'], gt_ray_drop=gt['gt_ray_drop'],
-            )
+            loss_lidar = self._compute_lidar_loss(lidar_out, gt)
 
         self.log(f'{stage}/gs', loss_gaussian.item(), on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
         self.log(f'{stage}/proj', loss_project.item(), on_step=True, on_epoch=True, prog_bar=True, sync_dist=True)
