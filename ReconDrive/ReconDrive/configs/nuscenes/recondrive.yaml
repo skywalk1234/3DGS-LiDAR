@@ -92,7 +92,7 @@ data_cfg:
   context_span: 1  # Reduced for 2Hz data (mini only has 2Hz keyframes)
   # Intermediate sweep supervision (train-only): build GT for K sweeps per window
   with_sweeps: true             # 训练时构建中间时刻 sweep GT（相机 + LIDAR_TOP）
-  num_sweeps_per_window: 2
+  num_sweeps_per_window: 2      # 仅用于 LIDAR_TOP GT 采样；相机 sweep 使用窗口内全部中间帧
   cameras: ['CAM_FRONT', 'CAM_FRONT_LEFT', 'CAM_FRONT_RIGHT', 'CAM_BACK_LEFT', 'CAM_BACK_RIGHT', 'CAM_BACK']
   # gt_ego_pose, gt_depth is not used during training, only for visulization
   train_requirements: (gt_pose, gt_ego_pose, gt_depth, mask)

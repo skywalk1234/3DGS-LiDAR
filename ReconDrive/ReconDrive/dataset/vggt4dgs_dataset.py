@@ -570,8 +570,10 @@ class NuScenesdataset4D(Dataset):
     def _build_sweep_supervision(self, frame0_token, frameN_token):
         """
         Build intermediate-time sweep GT for the window [frame0, frameN].
-        Returns a dict of tensors (K sweeps x num_cams cameras + K lidar), or {} if
-        no sweep is available. All tensors live on CPU and are moved to GPU by PL.
+        Camera: ALL raw sweeps strictly between the two keyframes are used
+        (K_cam x num_cams). LiDAR: K sampled sweeps (num_sweeps_per_window).
+        Returns a dict of tensors, or {} if no sweep is available. All tensors
+        live on CPU and are moved to GPU by PL.
         """
         K = self.num_sweeps_per_window
         num_cams = self.num_cameras
@@ -586,30 +588,38 @@ class NuScenesdataset4D(Dataset):
 
         fractions = np.linspace(0.3, 0.7, K)
 
-        # ===== Camera =====
-        camera_K = torch.zeros(K, num_cams, 3, 3)
-        camera_viewmat = torch.zeros(K, num_cams, 4, 4)
-        camera_gt = torch.zeros(K, num_cams, 3, self.sweep_h, self.sweep_w)
-        camera_t_seconds = torch.zeros(K, num_cams)
-        camera_span_seconds = torch.zeros(num_cams)
-        camera_valid = torch.zeros(K, num_cams, dtype=torch.bool)
-
+        # ===== Camera（窗口内所有中间 sweep 全部参与监督） =====
+        # 相机 6 通道在 nuScenes 中同步触发，各相机的 sweep 时间戳一致。
+        # K_cam 取所有相机的最大 sweep 数；不足的通道用 camera_valid=False 补齐。
+        cam_kf_ts = {}
+        cam_sweep_lists = {}
         for c, cam in enumerate(self.cameras):
             sd0 = self.dataset.get('sample_data', sample0['data'][cam])
             sdN = self.dataset.get('sample_data', sampleN['data'][cam])
             kf0_ts = int(sd0['timestamp'])
             kfN_ts = int(sdN['timestamp'])
+            cam_kf_ts[c] = (kf0_ts, kfN_ts)
             if kfN_ts <= kf0_ts:
+                cam_sweep_lists[c] = []
                 continue
             span = (kfN_ts - kf0_ts) / 1e6
             camera_span_seconds[c] = span
+            cam_sweep_lists[c] = self._sweeps_between(cam, kf0_ts, kfN_ts)
 
-            sweeps = self._sweeps_between(cam, kf0_ts, kfN_ts)
+        K_cam = max((len(v) for v in cam_sweep_lists.values()), default=0)
+        camera_K = torch.zeros(K_cam, num_cams, 3, 3)
+        camera_viewmat = torch.zeros(K_cam, num_cams, 4, 4)
+        camera_gt = torch.zeros(K_cam, num_cams, 3, self.sweep_h, self.sweep_w)
+        camera_t_seconds = torch.zeros(K_cam, num_cams)
+        camera_span_seconds = torch.zeros(num_cams)
+        camera_valid = torch.zeros(K_cam, num_cams, dtype=torch.bool)
+
+        for c, cam in enumerate(self.cameras):
+            kf0_ts, _ = cam_kf_ts[c]
+            sweeps = cam_sweep_lists[c]
             if not sweeps:
                 continue
-            for k in range(K):
-                target_ts = kf0_ts + fractions[k] * span * 1e6
-                best = min(sweeps, key=lambda r: abs(int(r['timestamp']) - target_ts))
+            for k, best in enumerate(sweeps):
                 best_ts = int(best['timestamp'])
                 camera_t_seconds[k, c] = (best_ts - kf0_ts) / 1e6
 
