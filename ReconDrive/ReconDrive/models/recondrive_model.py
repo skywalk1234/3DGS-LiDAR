@@ -828,7 +828,7 @@ class ReconDrive_LITModelModule(pl.LightningModule):
     def prob_sample_rendered_ids(self):
         # 12Hz 全量数据（interp_12Hz_trainval，context_span > 1）：
         # 确定性地渲染并监督 frame 0 + 全部中间帧（1..context_span-1），不做随机采样。
-        # mini（context_span=1）保持原有随机逻辑不变。
+        # mini（context_span=1）固定渲染 frame 0 + frame 1，取消随机采样。
         if getattr(self, 'context_span', 1) > 1:
             self.all_render_frame_ids = list(range(0, self.context_span))
             if hasattr(self, 'global_rank') and self.global_rank is not None:
@@ -837,45 +837,14 @@ class ReconDrive_LITModelModule(pl.LightningModule):
                 print(f"12Hz fixed rendered ids: {self.all_render_frame_ids}")
             return
 
-        num_frames = self.context_span + 1
-        prob_all_render_frame_ids = [0.7] + [0.3] * (num_frames - 2) + [0.2, 0.0] if num_frames >= 2 else [1.0]
-        prob_all_render_frame_ids = prob_all_render_frame_ids[:num_frames] if num_frames <= 7 else prob_all_render_frame_ids + [0.0] * (num_frames - 7)
-        prob_all_render_frame_ids = prob_all_render_frame_ids[:num_frames]
-        if len(prob_all_render_frame_ids) < num_frames:
-            prob_all_render_frame_ids += [0.0] * (num_frames - len(prob_all_render_frame_ids))
-
+        # mini（context_span=1）：固定渲染 frame 0 + frame 1，取消随机采样。
+        # 此前 frame 1（第二个 context 帧）只有 0.2 概率被选中，导致 frameN-half 高斯的
+        # 原生位姿大部分训练步无直接监督；现在每次都用两个 keyframe 直接监督。
+        self.all_render_frame_ids = list(range(0, self.context_span + 1))
         if hasattr(self, 'global_rank') and self.global_rank is not None:
-            rng = np.random.RandomState()
-            current_step = self.global_step if hasattr(self, 'global_step') else 0
-            temp_seed = hash((current_step, self.global_rank)) % (2**32)
-            rng.seed(temp_seed)
-            render_prob = rng.rand(num_frames)
+            print(f"[GPU {self.global_rank}] mini fixed rendered ids: {self.all_render_frame_ids}")
         else:
-            render_prob = np.random.rand(num_frames)
-
-        all_render_frame_ids_mask = render_prob < prob_all_render_frame_ids
-        selected_ids = np.nonzero(all_render_frame_ids_mask)[0].tolist()
-
-        if len(selected_ids) == 0:
-            valid_probs = np.array(prob_all_render_frame_ids[:-1] if num_frames > 1 else prob_all_render_frame_ids)
-            valid_probs = valid_probs / (valid_probs.sum() + 1e-8)
-            if hasattr(self, 'global_rank') and self.global_rank is not None:
-                selected_ids = [rng.choice(len(valid_probs), p=valid_probs)]
-            else:
-                selected_ids = [np.random.choice(len(valid_probs), p=valid_probs)]
-
-        if len(selected_ids) > 4:
-            if hasattr(self, 'global_rank') and self.global_rank is not None:
-                selected_ids = sorted(rng.choice(selected_ids, size=4, replace=False).tolist())
-            else:
-                selected_ids = sorted(np.random.choice(selected_ids, size=4, replace=False).tolist())
-
-        if hasattr(self, 'global_rank') and self.global_rank is not None:
-            print(f"[GPU {self.global_rank}] Sampling rendered ids: {selected_ids}")
-        else:
-            print(f"Sampling rendered ids: {selected_ids}")
-
-        self.all_render_frame_ids = selected_ids
+            print(f"mini fixed rendered ids: {self.all_render_frame_ids}")
          
 
     def _lidar_raster_bid(self, recontrast_data, means_t, rot_all, bid,

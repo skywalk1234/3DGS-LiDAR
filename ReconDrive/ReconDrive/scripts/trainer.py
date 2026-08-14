@@ -73,6 +73,10 @@ def main():
         main_cfg = yaml.load(f, Loader=yaml.FullLoader)
 
     main_cfg['model_cfg']['batch_size'] = main_cfg['data_cfg']['batch_size']
+    # 把时序配置从 data_cfg 显式传入 model_cfg，避免训练依赖 sanity val 的 set_normal_params 副作用
+    # （否则 self.context_span 在第一个 training_step 前不存在，prob_sample_rendered_ids 会取默认值/报错）
+    if 'context_span' in main_cfg['data_cfg']:
+        main_cfg['model_cfg']['context_span'] = main_cfg['data_cfg']['context_span']
 
     # Override devices if specified via command line
     if args.devices is not None:
