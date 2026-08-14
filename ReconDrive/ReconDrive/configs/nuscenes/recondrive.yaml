@@ -59,7 +59,7 @@ model_cfg:
   # keyframes, matching the evaluate_sweeps.py inference-time distribution.
   use_sweep_supervision: true   # mini 训练启用：渲染中间时刻 sweep，和 sweep 真值算相机+雷达损失
   use_sweep_camera_loss: true
-  use_sweep_lidar_loss: true
+  use_sweep_lidar_loss: false  # 取消中间帧 sweep 雷达监督：雷达真值仅在 frame0 / frameN 上监督
   lambda_sweep_camera: 1.0
   lambda_sweep_lidar: 1.0
   sweep_alpha_thresh: 0.05     # camera sweep mask: pixels with rasterized alpha > this
