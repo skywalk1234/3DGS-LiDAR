@@ -609,6 +609,14 @@ def run_sweep_evaluation(
                 continue
 
             recontrast = model.get_recontrast_data(window)
+            flow = recontrast["forward_flow"]
+            flow_abs = flow.abs()
+            print(
+                f"[flow] sample={sample_idx} shape={tuple(flow.shape)} "
+                f"max={float(flow_abs.max()):.3f} mean={float(flow_abs.mean()):.4f} "
+                f"nonzero_ratio={float((flow_abs > 1e-3).float().mean()):.4f}",
+                flush=True,
+            )
             span_seconds = float(getattr(model, "time_delta", 0.5))
 
             ctx = SweepContext(tables, frame0_token, frameN_token)
