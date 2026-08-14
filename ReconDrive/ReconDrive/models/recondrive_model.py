@@ -827,10 +827,11 @@ class ReconDrive_LITModelModule(pl.LightningModule):
 
     def prob_sample_rendered_ids(self):
         # 12Hz 全量数据（interp_12Hz_trainval，context_span > 1）：
-        # 确定性地渲染并监督 frame 0 + 全部中间帧（1..context_span-1），不做随机采样。
-        # mini（context_span=1）固定渲染 frame 0 + frame 1，取消随机采样。
+        # 固定渲染并监督 frame 0 + 全部中间帧 + 第二个 context 帧（frame N），不做随机采样。
+        # 含 frame N 让 frameN-half 高斯的原生位姿（t=context_span）也获得直接监督，
+        # 与 val 的 set_normal_params（渲染 0..context_span）保持对称。
         if getattr(self, 'context_span', 1) > 1:
-            self.all_render_frame_ids = list(range(0, self.context_span))
+            self.all_render_frame_ids = list(range(0, self.context_span + 1))
             if hasattr(self, 'global_rank') and self.global_rank is not None:
                 print(f"[GPU {self.global_rank}] 12Hz fixed rendered ids: {self.all_render_frame_ids}")
             else:
