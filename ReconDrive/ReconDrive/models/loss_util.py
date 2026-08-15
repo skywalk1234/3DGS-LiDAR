@@ -93,6 +93,9 @@ def compute_lidar_loss(pred_depth, gt_depth, pred_intensity, gt_intensity,
     if max_depth is not None:
         valid = valid * (gt_depth < max_depth).float()
     depth_loss = (F.l1_loss(pred_depth, gt_depth, reduction='none') * valid).sum() / valid.sum().clamp(min=1)
-    intensity_loss = F.l1_loss(pred_intensity, gt_intensity)
+    # Supervise intensity only on actual LiDAR returns (valid mask already excludes
+    # empty cells whose gt_depth == 0). Without this mask, empty cells (gt_intensity == 0)
+    # dominate the L1 loss and collapse the predicted intensity to ~0 everywhere.
+    intensity_loss = (F.l1_loss(pred_intensity, gt_intensity, reduction='none') * valid).sum() / valid.sum().clamp(min=1)
     raydrop_loss = F.binary_cross_entropy_with_logits(pred_ray_drop_logits, gt_ray_drop)
     return lambda_depth * depth_loss + lambda_intensity * intensity_loss + lambda_raydrop * raydrop_loss
