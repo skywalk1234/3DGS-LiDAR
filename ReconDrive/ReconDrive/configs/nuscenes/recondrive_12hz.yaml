@@ -75,6 +75,9 @@ model_cfg:
   lambda_lidar_raydrop: 0.01
   lambda_depth_direct: 1.0     # Direct sparse depth L1 loss weight
   lidar_feat_dim: 16
+  # frame N range image 监督开关：与 mini 同步关闭（验证是否导致侧相机近场灰底）。
+  # frame N 仍通过 depth_direct 稀疏投影监督；12Hz 的 frame N 相机 photometric 每步固定监督不受影响。
+  supervise_frameN_range: false
 
   # Intermediate-time sweep supervision (train-only, off by default).
   # 与 mini 同步保持关闭：怀疑中间帧相机监督的偏色信号导致侧相机近场灰底/紫边。

@@ -52,6 +52,9 @@ model_cfg:
   lambda_lidar_raydrop: 0.01
   lambda_depth_direct: 1.0     # Direct sparse depth L1 loss weight
   lidar_feat_dim: 16
+  # frame N range image 监督开关：false 时 render_lidar 只监督 frame 0 的 range image
+  # （frame N 仍通过 depth_direct 稀疏投影监督）。用于验证 frame N range 监督是否导致侧相机近场灰底。
+  supervise_frameN_range: false
 
   # Intermediate-time sweep supervision (train-only, off by default).
   # When on: input stays samples/keyframes, but the model also renders and

@@ -905,8 +905,14 @@ class ReconDrive_LITModelModule(pl.LightningModule):
         if self.use_vehicle_flow and flow is not None:
             means_t0[:, mid_point:] -= flow[:, mid_point:] * context_span_delta
 
-        # frame N 渲染（若 frame N 雷达 GT 存在）：frame 0-half 补偿到 tN，frame N-half 保持原生
-        has_frameN = 'raster_pts_fn' in lidar_data and lidar_data['raster_pts_fn'].numel() > 0
+        # frame N 渲染（若 frame N 雷达 GT 存在）：frame 0-half 补偿到 tN，frame N-half 保持原生。
+        # supervise_frameN_range=false 时关闭 frame N range image 监督（_compute_lidar_loss 会因
+        # 'depth_fn' 不在 lidar_out 而自动跳过 frame N loss）；默认 true 保持原行为。
+        has_frameN = (
+            getattr(self, 'supervise_frameN_range', True)
+            and 'raster_pts_fn' in lidar_data
+            and lidar_data['raster_pts_fn'].numel() > 0
+        )
         means_tN = None
         if has_frameN:
             means_tN = means_all.clone()
