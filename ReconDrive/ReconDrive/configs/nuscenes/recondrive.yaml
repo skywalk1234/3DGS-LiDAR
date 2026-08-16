@@ -57,10 +57,12 @@ model_cfg:
   # When on: input stays samples/keyframes, but the model also renders and
   # supervises the raw camera + LIDAR_TOP sweeps strictly between the two
   # keyframes, matching the evaluate_sweeps.py inference-time distribution.
-  use_sweep_supervision: true   # mini 训练启用：渲染中间时刻 sweep，和 sweep 真值算相机+雷达损失
+  # 已暂时关闭：怀疑中间帧相机监督的偏色信号导致侧相机近场灰底/紫边。
+  # 关闭后仍固定监督 frame 0 + frame N（6ced49c），空洞不会像 new_head 那样严重。
+  use_sweep_supervision: false  # 关闭中间帧 sweep 监督（验证灰底是否由其引起）
   use_sweep_camera_loss: true
   use_sweep_lidar_loss: false  # 取消中间帧 sweep 雷达监督：雷达真值仅在 frame0 / frameN 上监督
-  lambda_sweep_camera: 1.0
+  lambda_sweep_camera: 1.0   # 重开 sweep 相机监督时若需降权，从这里调（如 0.3）
   lambda_sweep_lidar: 1.0
   sweep_alpha_thresh: 0.05     # camera sweep mask: pixels with rasterized alpha > this
   sweep_lidar_max_depth: 80.0  # only supervise lidar depth < 80m (aligns with evaluate_sweeps)
@@ -91,7 +93,7 @@ data_cfg:
   nuscenes_version: 'v1.0-mini'
   context_span: 1  # Reduced for 2Hz data (mini only has 2Hz keyframes)
   # Intermediate sweep supervision (train-only): build GT for K sweeps per window
-  with_sweeps: true             # 训练时构建中间时刻 sweep GT（相机 + LIDAR_TOP）
+  with_sweeps: false            # sweep 监督已关（use_sweep_supervision: false），不再构建中间帧 sweep GT，省加载开销
   num_sweeps_per_window: 2      # 仅用于 LIDAR_TOP GT 采样；相机 sweep 使用窗口内全部中间帧
   cameras: ['CAM_FRONT', 'CAM_FRONT_LEFT', 'CAM_FRONT_RIGHT', 'CAM_BACK_LEFT', 'CAM_BACK_RIGHT', 'CAM_BACK']
   # gt_ego_pose, gt_depth is not used during training, only for visulization

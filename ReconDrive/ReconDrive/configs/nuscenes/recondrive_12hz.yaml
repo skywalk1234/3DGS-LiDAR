@@ -77,11 +77,12 @@ model_cfg:
   lidar_feat_dim: 16
 
   # Intermediate-time sweep supervision (train-only, off by default).
-  # 12Hz 下保持关闭：中间关键帧本身就是监督目标，不需要再用 raw sweep 监督。
+  # 与 mini 同步保持关闭：怀疑中间帧相机监督的偏色信号导致侧相机近场灰底/紫边。
+  # 关闭后仍固定监督 frame 0 + 全部中间帧 + frame N（bb5ffba），不做 sweep。
   use_sweep_supervision: false
   use_sweep_camera_loss: true
-  use_sweep_lidar_loss: true
-  lambda_sweep_camera: 1.0
+  use_sweep_lidar_loss: false  # 与 mini 对齐：中间帧 sweep 雷达监督保持关闭
+  lambda_sweep_camera: 1.0   # 重开 sweep 相机监督时若需降权，从这里调（如 0.3）
   lambda_sweep_lidar: 1.0
   sweep_alpha_thresh: 0.05     # camera sweep mask: pixels with rasterized alpha > this
   sweep_lidar_max_depth: 80.0  # only supervise lidar depth < 80m (aligns with evaluate_sweeps)
@@ -116,7 +117,7 @@ data_cfg:
   nuscenes_version: 'interp_12Hz_trainval'
   context_span: 6  # 12Hz 下窗口 = frame 0 + 6 帧后 = 0.5s 间隔
   # Intermediate sweep supervision (train-only): build GT for K sweeps per window
-  with_sweeps: false
+  with_sweeps: false            # sweep 监督已关，不构建中间帧 sweep GT
   num_sweeps_per_window: 2
   cameras: ['CAM_FRONT', 'CAM_FRONT_LEFT', 'CAM_FRONT_RIGHT', 'CAM_BACK_LEFT', 'CAM_BACK_RIGHT', 'CAM_BACK']
   # gt_ego_pose, gt_depth is not used during training, only for visulization
